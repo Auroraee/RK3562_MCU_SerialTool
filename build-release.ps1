@@ -1,0 +1,223 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Version,
+    [string]$Notes = "",
+    [switch]$RunTests,
+    [switch]$Push,
+    [switch]$CreateRelease,
+    [switch]$WhatIf
+)
+
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $repoRoot
+
+$pythonFile = Join-Path $repoRoot "rk3562_uart_tester.py"
+$iconFile = Join-Path $repoRoot "a.ico"
+$releaseDir = Join-Path $repoRoot "release"
+$distDir = Join-Path $repoRoot "dist"
+$buildDir = Join-Path $repoRoot "build"
+$specFile = Join-Path $repoRoot "rk3562_uart_tester.spec"
+$mainBranch = "main"
+$appName = "rk3562_mcu_uart_validation_tool"
+$appTitle = "RK3562 MCU UART Validation Tool"
+
+if ($Version -notmatch '^v?\d+\.\d+\.\d+$') {
+    throw "Version must look like 1.2.0 or v1.2.0"
+}
+
+$normalizedVersion = $Version.TrimStart('v')
+$tag = "v$normalizedVersion"
+$releaseExeName = "${appName}_${tag}.exe"
+$releaseZipName = "${appName}_${tag}.zip"
+$distExe = Join-Path $distDir "$appName.exe"
+$releaseExe = Join-Path $releaseDir $releaseExeName
+$releaseZip = Join-Path $releaseDir $releaseZipName
+$defaultNotes = @"
+## Summary
+- Release $tag for $appTitle
+
+## Assets
+- $releaseExeName
+- $releaseZipName
+"@
+if ([string]::IsNullOrWhiteSpace($Notes)) {
+    $Notes = $defaultNotes
+}
+$commitMessage = "Release version $normalizedVersion."
+
+function Invoke-Step {
+    param(
+        [string]$Message,
+        [scriptblock]$Action
+    )
+
+    Write-Host "==> $Message"
+    if ($WhatIf) {
+        return
+    }
+    & $Action
+}
+
+function Invoke-CheckedCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed: $FilePath $($Arguments -join ' ')"
+    }
+}
+
+function Get-CommandPath {
+    param([string]$Name)
+
+    $command = Get-Command $Name -ErrorAction Stop
+    return $command.Source
+}
+
+$pythonCmd = Get-CommandPath "python"
+$pyinstallerCmd = Get-CommandPath "pyinstaller"
+$gitCmd = Get-CommandPath "git"
+$ghCmd = Get-CommandPath "gh"
+
+$currentBranch = (& $gitCmd branch --show-current).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to detect current git branch"
+}
+if ($currentBranch -ne $mainBranch) {
+    throw "Release script must run on $mainBranch. Current branch: $currentBranch"
+}
+
+$originUrl = (& $gitCmd remote get-url origin).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to read git remote origin"
+}
+if ([string]::IsNullOrWhiteSpace($originUrl)) {
+    throw "Git remote origin is not configured"
+}
+
+$statusLines = & $gitCmd status --porcelain
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to read git status"
+}
+if ($statusLines) {
+    $allowedDirty = @(" M rk3562_uart_tester.py", "?? build-release.ps1", " M build-release.ps1")
+    $unexpected = @($statusLines | Where-Object { $_ -notin $allowedDirty })
+    if ($unexpected.Count -gt 0) {
+        throw "Working tree has unrelated changes:`n$($unexpected -join "`n")"
+    }
+}
+
+$source = Get-Content -Path $pythonFile -Raw
+$versionPattern = 'APP_VERSION = "[^"]+"'
+if ($source -notmatch $versionPattern) {
+    throw "APP_VERSION constant not found in rk3562_uart_tester.py"
+}
+$newSource = [regex]::Replace($source, $versionPattern, "APP_VERSION = `"$normalizedVersion`"", 1)
+
+Invoke-Step "Update app version to $normalizedVersion" {
+    Set-Content -Path $pythonFile -Value $newSource -Encoding UTF8
+}
+
+if ($RunTests) {
+    Invoke-Step "Run syntax check" {
+        Invoke-CheckedCommand $pythonCmd @("-m", "py_compile", $pythonFile)
+    }
+}
+
+Invoke-Step "Build Windows executable" {
+    Invoke-CheckedCommand $pyinstallerCmd @(
+        "--noconfirm",
+        "--clean",
+        "--onefile",
+        "--windowed",
+        "--icon", $iconFile,
+        "--name", $appName,
+        $pythonFile
+    )
+}
+
+Invoke-Step "Prepare release directory" {
+    New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+    Remove-Item -Path $releaseExe, $releaseZip -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $distExe -Destination $releaseExe -Force
+    Compress-Archive -Path $releaseExe -DestinationPath $releaseZip -Force
+}
+
+Invoke-Step "Remove generated build artifacts" {
+    Remove-Item -Path $buildDir, $distDir, $specFile -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Invoke-Step "Fetch remote tags" {
+    Invoke-CheckedCommand $gitCmd @("fetch", "--tags", "origin")
+}
+
+$localTagExists = & $gitCmd rev-parse -q --verify "refs/tags/$tag" 2>$null
+if ($LASTEXITCODE -eq 0 -and $localTagExists) {
+    throw "Tag $tag already exists locally"
+}
+
+$remoteTagExists = & $gitCmd ls-remote --tags origin $tag
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to query remote tags"
+}
+if (-not [string]::IsNullOrWhiteSpace($remoteTagExists)) {
+    throw "Tag $tag already exists on origin"
+}
+
+& $ghCmd release view $tag 1>$null 2>$null
+if ($LASTEXITCODE -eq 0) {
+    throw "GitHub release $tag already exists"
+}
+
+Invoke-Step "Show files to commit" {
+    & $gitCmd status --short -- $pythonFile (Join-Path $repoRoot "build-release.ps1")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to show pending source changes"
+    }
+}
+
+Invoke-Step "Commit source changes" {
+    Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, (Join-Path $repoRoot "build-release.ps1"))
+    Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
+}
+
+if ($Push) {
+    Invoke-Step "Push branch $mainBranch" {
+        Invoke-CheckedCommand $gitCmd @("push", "origin", $mainBranch)
+    }
+
+    Invoke-Step "Create release tag $tag" {
+        Invoke-CheckedCommand $gitCmd @("tag", "-a", $tag, "-m", "Release $tag")
+        Invoke-CheckedCommand $gitCmd @("push", "origin", $tag)
+    }
+} else {
+    Invoke-Step "Create local release tag $tag" {
+        Invoke-CheckedCommand $gitCmd @("tag", "-a", $tag, "-m", "Release $tag")
+    }
+}
+
+if ($CreateRelease) {
+    if (-not $Push) {
+        throw "-CreateRelease requires -Push so the tag exists on GitHub"
+    }
+
+    Invoke-Step "Create GitHub release $tag" {
+        Invoke-CheckedCommand $ghCmd @(
+            "release", "create", $tag,
+            $releaseExe,
+            $releaseZip,
+            "--title", $tag,
+            "--notes", $Notes
+        )
+    }
+}
+
+Write-Host "Release workflow completed for $tag"
+if ($WhatIf) {
+    Write-Host "WhatIf mode did not modify files or publish anything"
+}

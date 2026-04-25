@@ -40,6 +40,9 @@ import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
+APP_NAME = "RK3562 MCU UART Validation Tool"
+APP_VERSION = "1.1.1"
+
 
 def enable_windows_dpi_awareness():
     if platform.system() != "Windows":
@@ -392,7 +395,7 @@ class App(tk.Tk):
         super().__init__()
         self._apply_windows_dpi_scaling()
 
-        self.title("RK3562 ↔ MCU  UART Tester  v1.1.0")
+        self.title(f"{APP_NAME}  v{APP_VERSION}")
         self.minsize(self._s(960), self._s(640))
 
         # Theme — keep the same palette in both OS light/dark modes
