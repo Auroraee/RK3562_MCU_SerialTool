@@ -1,0 +1,1187 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RK3562 <-> MCU  UART 通信测试工具
+模拟 RK3562 端，对 MCU 固件进行自测
+Simulates RK3562 side for MCU firmware self-testing
+"""
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError as exc:
+    raise RuntimeError("pyserial is required. Install it with: pip install pyserial") from exc
+
+import struct
+import queue
+import threading
+import datetime
+import time
+import os
+import platform
+import ctypes
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+
+
+def enable_windows_dpi_awareness():
+    if platform.system() != "Windows":
+        return
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CRC8  (Polynomial 0x07, Init 0x00, No Reflect)
+# ═══════════════════════════════════════════════════════════════════
+# CRC-8/SAE-J1850  Poly=0x1D  Init=0xFF  XorOut=0xFF
+# Lookup table matches MCU's Cal_Crc8Tab exactly
+_CRC8_TABLE = [
+    0x00,0x1d,0x3a,0x27,0x74,0x69,0x4e,0x53,0xe8,0xf5,0xd2,0xcf,0x9c,0x81,0xa6,0xbb,
+    0xcd,0xd0,0xf7,0xea,0xb9,0xa4,0x83,0x9e,0x25,0x38,0x1f,0x02,0x51,0x4c,0x6b,0x76,
+    0x87,0x9a,0xbd,0xa0,0xf3,0xee,0xc9,0xd4,0x6f,0x72,0x55,0x48,0x1b,0x06,0x21,0x3c,
+    0x4a,0x57,0x70,0x6d,0x3e,0x23,0x04,0x19,0xa2,0xbf,0x98,0x85,0xd6,0xcb,0xec,0xf1,
+    0x13,0x0e,0x29,0x34,0x67,0x7a,0x5d,0x40,0xfb,0xe6,0xc1,0xdc,0x8f,0x92,0xb5,0xa8,
+    0xde,0xc3,0xe4,0xf9,0xaa,0xb7,0x90,0x8d,0x36,0x2b,0x0c,0x11,0x42,0x5f,0x78,0x65,
+    0x94,0x89,0xae,0xb3,0xe0,0xfd,0xda,0xc7,0x7c,0x61,0x46,0x5b,0x08,0x15,0x32,0x2f,
+    0x59,0x44,0x63,0x7e,0x2d,0x30,0x17,0x0a,0xb1,0xac,0x8b,0x96,0xc5,0xd8,0xff,0xe2,
+    0x26,0x3b,0x1c,0x01,0x52,0x4f,0x68,0x75,0xce,0xd3,0xf4,0xe9,0xba,0xa7,0x80,0x9d,
+    0xeb,0xf6,0xd1,0xcc,0x9f,0x82,0xa5,0xb8,0x03,0x1e,0x39,0x24,0x77,0x6a,0x4d,0x50,
+    0xa1,0xbc,0x9b,0x86,0xd5,0xc8,0xef,0xf2,0x49,0x54,0x73,0x6e,0x3d,0x20,0x07,0x1a,
+    0x6c,0x71,0x56,0x4b,0x18,0x05,0x22,0x3f,0x84,0x99,0xbe,0xa3,0xf0,0xed,0xca,0xd7,
+    0x35,0x28,0x0f,0x12,0x41,0x5c,0x7b,0x66,0xdd,0xc0,0xe7,0xfa,0xa9,0xb4,0x93,0x8e,
+    0xf8,0xe5,0xc2,0xdf,0x8c,0x91,0xb6,0xab,0x10,0x0d,0x2a,0x37,0x64,0x79,0x5e,0x43,
+    0xb2,0xaf,0x88,0x95,0xc6,0xdb,0xfc,0xe1,0x5a,0x47,0x60,0x7d,0x2e,0x33,0x14,0x09,
+    0x7f,0x62,0x45,0x58,0x0b,0x16,0x31,0x2c,0x97,0x8a,0xad,0xb0,0xe3,0xfe,0xd9,0xc4,
+]
+
+def crc8(data: bytes) -> int:
+    """CRC-8/SAE-J1850: matches MCU Crc_CalculateCRC8(..., IsFirstCall=TRUE)."""
+    crc = 0xFF                          # CRC_INITVALUE8
+    for byte in data:
+        crc = _CRC8_TABLE[crc ^ byte]
+    return crc ^ 0xFF                   # XOR CRC_XORVALUE8
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Protocol Constants
+# ═══════════════════════════════════════════════════════════════════
+FRAME_HEADER = 0x5A
+FRAME_END    = 0xA5
+
+FT_NO_ACK    = 0x01   # No ACK needed
+FT_NEED_ACK  = 0x02   # Requires ACK
+FT_ACK_OK    = 0x03   # ACK OK
+FT_ACK_ERR   = 0x04   # ACK Error
+
+FT_NAMES = {
+    FT_NO_ACK:   "No ACK",
+    FT_NEED_ACK: "Need ACK",
+    FT_ACK_OK:   "ACK Ok",
+    FT_ACK_ERR:  "ACK Error",
+}
+
+# (中文名称, direction, default_frame_type)
+CMD_TABLE = {
+    0x0000: ("查询外设状态",            "RK→MCU", FT_NO_ACK),
+    0x0001: ("查询配置参数",            "RK→MCU", FT_NO_ACK),
+    0x0002: ("RK3562 心跳",            "RK→MCU", FT_NO_ACK),
+    0x0003: ("MCU 心跳",               "MCU→RK", FT_NO_ACK),
+    0x0100: ("MCU 上报状态",           "MCU→RK", FT_NO_ACK),
+    0x0101: ("设备类型",               "MCU→RK", FT_ACK_OK),
+    0x0102: ("磁栅类型",               "MCU→RK", FT_ACK_OK),
+    0x0103: ("人在传感器参数",          "MCU→RK", FT_ACK_OK),
+    0x0104: ("霍尔传感器1 配置参数",    "MCU→RK", FT_ACK_OK),
+    0x0105: ("霍尔传感器2 配置参数",    "MCU→RK", FT_ACK_OK),
+    0x0106: ("设备 SN",                "MCU→RK", FT_ACK_OK),
+    0x0107: ("清除使用时长",            "RK→MCU", FT_NO_ACK),
+    0x0108: ("RK3562 版本号",          "RK→MCU", FT_NEED_ACK),
+    0x0109: ("强制升级",               "MCU→RK", FT_ACK_OK),
+    0x010A: ("LED 与护眼屏控制",       "RK→MCU", FT_NEED_ACK),
+    0x010B: ("系统重启",               "MCU→RK", FT_ACK_OK),
+    0x010C: ("Ultra 电机控制 (步进)",  "RK→MCU", FT_NEED_ACK),
+    0x010D: ("Ultra 电机控制 (目标值)","RK→MCU", FT_NEED_ACK),
+    0x010E: ("Ultra 电机调节结果",     "MCU→RK", FT_NO_ACK),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Frame Builder
+# ═══════════════════════════════════════════════════════════════════
+def build_frame(frame_type: int, serial_count: int, cmd: int,
+                payload: bytes = b'') -> bytes:
+    """
+    Frame layout (little-endian multi-byte fields):
+      Header(1) | FrameType(1) | SerialCount(2) | CMD(2) |
+      Length(2) | Payload(n) | CRC8(1) | End(1)
+    CRC8 covers everything from Header through Payload.
+    """
+    hdr = struct.pack('>BBHHH',
+                      FRAME_HEADER, frame_type, serial_count, cmd, len(payload))
+    body = hdr + payload
+    return body + bytes([crc8(body), FRAME_END])
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Frame Parser  (streaming buffer)
+# ═══════════════════════════════════════════════════════════════════
+def parse_from_buffer(buf: bytearray):
+    """
+    Try to extract one frame from buf.
+    Returns:
+        (frame_dict, n)  — valid frame, consume n bytes
+        (None, n)        — n > 0: skip n garbage bytes; n == 0: need more data
+    """
+    # Find header
+    idx = 0
+    while idx < len(buf) and buf[idx] != FRAME_HEADER:
+        idx += 1
+    if idx > 0:
+        return None, idx          # skip bytes before first 0x5A
+
+    if len(buf) < 10:
+        return None, 0            # need at least 10 bytes
+
+    _, ft, sc, cmd, length = struct.unpack_from('>BBHHH', buf, 0)
+
+    if length > 1024:             # sanity: max payload 1024
+        return None, 1            # bad frame, skip this header byte
+
+    total = 10 + length           # 8 header bytes + payload + crc + end
+    if len(buf) < total:
+        return None, 0            # wait for rest of frame
+
+    raw = bytes(buf[:total])
+    if raw[-1] != FRAME_END:
+        return None, 1            # bad end byte, skip header
+
+    payload   = raw[8 : 8 + length]
+    cs_recv   = raw[8 + length]
+    cs_calc   = crc8(raw[:8 + length])
+
+    frame = {
+        'ft':       ft,
+        'ft_name':  FT_NAMES.get(ft, f'0x{ft:02X}'),
+        'sc':       sc,
+        'cmd':      cmd,
+        'cmd_name': CMD_TABLE.get(cmd, (f'CMD_0x{cmd:04X}',))[0],
+        'length':   length,
+        'payload':  payload,
+        'crc_ok':   cs_recv == cs_calc,
+        'cs_recv':  cs_recv,
+        'cs_calc':  cs_calc,
+        'raw':      raw,
+    }
+    return frame, total
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Payload Decoder  (human-readable)
+# ═══════════════════════════════════════════════════════════════════
+def decode_payload(cmd: int, payload: bytes) -> str:
+    """Returns a decoded description string, or empty string."""
+    try:
+        if cmd == 0x0100 and len(payload) >= 11:
+            state_map = {
+                0x01: "待机+前盖关闭",
+                0x02: "待机+前盖开+平镜关",
+                0x03: "待机+前盖开+平镜开",
+                0x04: "工作+前盖开+平镜开(uint)",
+            }
+            brightness = {1: "低亮度", 2: "中亮度", 3: "高亮度"}
+            color_temp  = {1: "冷光", 2: "常规", 3: "暖光"}
+            usage_time  = (payload[6] << 8) | payload[7]
+            parts = [
+                f"设备状态: {state_map.get(payload[0], f'0x{payload[0]:02X}')}",
+                f"LED: {'开' if payload[1] == 0x00 else '关'}",
+                f"亮度: {brightness.get(payload[2], f'0x{payload[2]:02X}')}",
+                f"色温: {color_temp.get(payload[3], f'0x{payload[3]:02X}')}",
+                f"使用时长: {usage_time} s",
+                f"霍尔1 (LED): {'合盖/关灯' if payload[8] == 0x01 else '开盖/开灯'}",
+                f"霍尔2 (遮光板): {'有磁场' if payload[9] == 0x01 else '无磁场'}",
+                f"护眼屏: {'已接入' if payload[10] == 0x01 else '未接入'}",
+            ]
+            return "\n                ".join(parts)
+
+        elif cmd == 0x0101 and len(payload) >= 2:
+            dev_map = {0x00: "Air", 0x01: "Pro", 0x02: "Max",
+                       0x03: "Ultra", 0x04: "LE Display", 0xFF: "无效"}
+            gen = payload[1]
+            gen_str = f"0x{gen:02X} (invalid)" if gen in (0x00, 0xFF) else f"0x{gen:02X}"
+            return (f"设备类型: {dev_map.get(payload[0], f'0x{payload[0]:02X}')}  "
+                    f"代际编码: {gen_str}")
+
+        elif cmd == 0x0102 and len(payload) >= 1:
+            type_map = {0x00: "对向反射膜", 0x01: "外采磁栅", 0x02: "自研磁栅"}
+            return f"磁栅类型: {type_map.get(payload[0], f'0x{payload[0]:02X}')}"
+
+        elif cmd == 0x0103 and len(payload) >= 2:
+            return (f"人在门限: {payload[0]}  无人延时: {payload[1]} s  "
+                    f"门参数: {payload[2:].hex().upper() if len(payload) > 2 else 'N/A'}")
+
+        elif cmd in (0x0104, 0x0105) and len(payload) >= 2:
+            sensor_id = "霍尔1" if cmd == 0x0104 else "霍尔2"
+            return f"{sensor_id} 配置: Byte0=0x{payload[0]:02X}  Byte1=0x{payload[1]:02X}"
+
+        elif cmd == 0x0106:
+            try:
+                sn = payload.rstrip(b'\x00').decode('ascii')
+                return f"设备SN: {sn}"
+            except Exception:
+                return f"设备SN (hex): {payload.hex().upper()}"
+
+        elif cmd == 0x0107 and len(payload) >= 1:
+            return f"操作: {'清除使用时长' if payload[0] == 0xAA else f'无效值 0x{payload[0]:02X}'}"
+
+        elif cmd == 0x0108 and len(payload) >= 3:
+            return f"RK3562 版本: {payload[0]}.{payload[1]}.{payload[2]}"
+
+        elif cmd == 0x0109 and len(payload) >= 1:
+            return f"强制升级: {'进入强制升级' if payload[0] == 0xAA else f'无效值 0x{payload[0]:02X}'}"
+
+        elif cmd == 0x010A and len(payload) >= 3:
+            brightness = {1: "低", 2: "中", 3: "高"}
+            color_temp  = {1: "冷光", 2: "常规", 3: "暖光"}
+            return (f"LED: {'开' if payload[0] == 0x01 else '关'}  "
+                    f"亮度: {brightness.get(payload[1], f'0x{payload[1]:02X}')}  "
+                    f"色温: {color_temp.get(payload[2], f'0x{payload[2]:02X}')}")
+
+        elif cmd == 0x010B and len(payload) >= 1:
+            return f"系统重启: {'执行' if payload[0] == 0xAA else f'无效值 0x{payload[0]:02X}'}"
+
+        elif cmd == 0x010C and len(payload) >= 2:
+            direction = {0x01: "向上", 0x02: "向下"}
+            return (f"方向: {direction.get(payload[0], f'0x{payload[0]:02X}')}  "
+                    f"移动距离: {payload[1]} 分米")
+
+        elif cmd == 0x010D and len(payload) >= 1:
+            return f"目标像距: {payload[0]} 分米"
+
+        elif cmd == 0x010E and len(payload) >= 2:
+            return (f"调节结果: {'成功' if payload[0] == 0x01 else '失败'}  "
+                    f"当前像距: {payload[1]} 分米")
+
+    except Exception as exc:
+        return f"[Decode error: {exc}]"
+
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Payload Input Dialog
+# ═══════════════════════════════════════════════════════════════════
+class PayloadDialog(simpledialog.Dialog):
+    """Generic dialog to input payload fields."""
+
+    def __init__(self, parent, title: str,
+                 fields: list):   # [(label, default, hint), ...]
+        self.fields  = fields
+        self.result  = None
+        super().__init__(parent, title=title)
+
+    def body(self, master):
+        C = self.parent.C
+        master.configure(bg=C["panel"])
+        self.entries = []
+        for i, (label, default, hint) in enumerate(self.fields):
+            tk.Label(master, text=label, bg=C["panel"], fg=C["fg"],
+                     font=("Courier New", 9)).grid(
+                row=i, column=0, sticky="w", padx=8, pady=4)
+            e = tk.Entry(master, bg=C["card"], fg=C["green"],
+                         insertbackground=C["green"],
+                         font=("Courier New", 10), width=16)
+            e.insert(0, default)
+            e.grid(row=i, column=1, padx=6, pady=4)
+            if hint:
+                tk.Label(master, text=hint, bg=C["panel"], fg=C["fgdim"],
+                         font=("Courier New", 8)).grid(
+                    row=i, column=2, padx=6, sticky="w")
+            self.entries.append(e)
+        return self.entries[0] if self.entries else None
+
+    def apply(self):
+        self.result = [e.get().strip() for e in self.entries]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Main Application
+# ═══════════════════════════════════════════════════════════════════
+class App(tk.Tk):
+
+    # ── Shared palette: keep the same Morandi light appearance in all OS themes ──
+    THEME_C = {
+        "bg":      "#faf8f5",   # warm white
+        "panel":   "#f0ede7",   # warm light gray
+        "card":    "#e6e2d9",   # greige card
+        "hover":   "#dbd5ca",   # warm hover
+        "fg":      "#3d3833",   # soft charcoal
+        "fgdim":   "#b0a99e",   # muted warm gray
+        "accent":  "#c4877b",   # dusty rose (errors / disconnect)
+        "green":   "#7d9b7e",   # sage green (TX / CRC OK)
+        "blue":    "#7b8fa0",   # muted steel blue (RX)
+        "yellow":  "#b8a878",   # muted gold (info / warnings)
+        "hb":      "#e5e1d7",   # heartbeat: almost invisible on warm white
+        "hb_hex":  "#ede9e0",
+    }
+
+    # ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _detect_dark_mode() -> bool:
+        """Return True if the OS is currently in dark mode."""
+        import platform
+        system = platform.system()
+        try:
+            if system == "Windows":
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                winreg.CloseKey(key)
+                return val == 0           # 0 = dark, 1 = light
+            elif system == "Darwin":
+                import subprocess
+                r = subprocess.run(
+                    ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                    capture_output=True, text=True)
+                return r.stdout.strip().lower() == "dark"
+            elif system == "Linux":
+                import subprocess
+                r = subprocess.run(
+                    ["gsettings", "get",
+                     "org.gnome.desktop.interface", "color-scheme"],
+                    capture_output=True, text=True)
+                return "dark" in r.stdout.lower()
+        except Exception:
+            pass
+        return True   # default to dark if detection fails
+
+    def __init__(self):
+        super().__init__()
+        self._apply_windows_dpi_scaling()
+        self.title("RK3562 ↔ MCU  UART Tester  v1.0")
+        self.minsize(960, 640)
+
+        # Theme — keep the same palette in both OS light/dark modes
+        self._dark = self._detect_dark_mode()
+        self.C = self.THEME_C.copy()
+        self.configure(bg=self.C["bg"])
+
+        self.ser: serial.Serial | None = None
+        self.rx_thread: threading.Thread | None = None
+        self.running  = False
+        self.sc       = 0            # serial count
+        self.rx_buf   = bytearray()
+        self.log_q    = queue.Queue()
+        self.stats    = {"tx": 0, "rx": 0, "err": 0}
+
+        # heartbeat state
+        self.hb_rk_enabled  = tk.BooleanVar(value=False)
+        self.hb_rk_thread: threading.Thread | None = None
+        self.hb_running = False
+
+        self._apply_styles()
+        self._build_ui()
+        self.update_idletasks()
+        self._fit_initial_height()
+        self._refresh_ports()
+        self._pump_log()
+        self._poll_theme()   # start system theme watcher
+
+    def _fit_initial_height(self):
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = min(1360, max(980, screen_w - 120))
+        button_bottom = self.manual_send_btn.winfo_rooty() + self.manual_send_btn.winfo_height()
+        window_top = self.winfo_rooty()
+        frame_height = button_bottom - window_top + 20
+        height = min(screen_h - 80, max(720, frame_height))
+        self.geometry(f"{width}x{height}")
+
+    def _apply_windows_dpi_scaling(self):
+        if platform.system() != "Windows":
+            return
+        try:
+            self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
+        except Exception:
+            pass
+
+    # ── Styles ────────────────────────────────────────────────────
+    def _apply_styles(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        C = self.C
+        base = {"background": C["bg"], "foreground": C["fg"],
+                "borderwidth": 0, "relief": "flat"}
+        s.configure("TFrame",        **base)
+        s.configure("TLabel",        **base)
+        s.configure("Panel.TFrame",  background=C["panel"])
+        s.configure("Panel.TLabel",  background=C["panel"], foreground=C["fg"])
+        s.configure("TCombobox",
+                    fieldbackground=C["card"], background=C["card"],
+                    foreground=C["fg"], selectbackground=C["accent"],
+                    selectforeground="#faf8f5", arrowcolor=C["fg"],
+                    padding=(8, 6), arrowsize=18)
+        s.map("TCombobox", fieldbackground=[("readonly", C["card"])],
+              foreground=[("readonly", C["fg"])])
+        for name, bg, fg in (
+            ("Norm.TButton",   C["card"],   C["fg"]),
+            ("Accent.TButton", C["accent"], "#e8e0d8"),
+            ("Green.TButton",  "#7d9b7e",   "#faf8f5"),
+            ("Blue.TButton",   C["blue"],   "#e8e0d8"),
+        ):
+            s.configure(name, background=bg, foreground=fg,
+                        borderwidth=0, focusthickness=0, padding=(8, 8),
+                        font=("Microsoft YaHei UI", 10))
+            s.map(name,
+                  background=[("active",   C["hover"]),
+                               ("disabled", C["fgdim"])],
+                  foreground=[("disabled",  C["fgdim"])])
+        s.configure("TScrollbar", background=C["card"],
+                    troughcolor=C["panel"], arrowcolor=C["fgdim"])
+
+    # ── UI Construction ───────────────────────────────────────────
+    def _build_ui(self):
+        self._build_toolbar()
+
+        body = tk.Frame(self, bg=self.C["bg"])
+        body.pack(fill="both", expand=True, padx=8, pady=(4, 6))
+
+        # Left panel (fixed width)
+        left = tk.Frame(body, bg=self.C["panel"], width=420)
+        self.left_panel = left
+        left.pack(side="left", fill="y", padx=(0, 6))
+        left.pack_propagate(False)
+        self._build_cmd_panel(left)
+
+        # Right: log
+        right = tk.Frame(body, bg=self.C["bg"])
+        right.pack(side="left", fill="both", expand=True)
+        self._build_log_panel(right)
+
+    # ── Toolbar ───────────────────────────────────────────────────
+    def _build_toolbar(self):
+        tb = tk.Frame(self, bg=self.C["panel"], height=50)
+        tb.pack(fill="x", side="top")
+        tb.pack_propagate(False)
+
+        def lbl(text, **kw):
+            return tk.Label(tb, text=text, bg=self.C["panel"],
+                            fg=self.C["fgdim"], font=("Microsoft YaHei UI", 9), **kw)
+
+        lbl("PORT").pack(side="left", padx=(14, 2), pady=14)
+        self.port_var = tk.StringVar()
+        self.port_cb  = ttk.Combobox(tb, textvariable=self.port_var,
+                                      width=11, state="readonly")
+        self.port_cb.pack(side="left", pady=10, padx=2)
+
+        ttk.Button(tb, text="⟳", style="Norm.TButton", width=2,
+                   command=self._refresh_ports).pack(side="left", padx=2, pady=10)
+
+        lbl("BAUD").pack(side="left", padx=(10, 2))
+        self.baud_var = tk.StringVar(value="115200")
+        ttk.Combobox(tb, textvariable=self.baud_var, width=9,
+                     values=["9600","19200","38400","57600",
+                              "115200","230400","460800"],
+                     state="readonly").pack(side="left", pady=10, padx=2)
+
+        self.conn_btn = ttk.Button(tb, text="CONNECT",
+                                    style="Green.TButton",
+                                    command=self._toggle_connect)
+        self.conn_btn.pack(side="left", padx=(18, 4), pady=10)
+
+        self.dot = tk.Label(tb, text="●", bg=self.C["panel"],
+                             fg="#333", font=("Courier New", 18))
+        self.dot.pack(side="left", padx=2)
+        self.conn_lbl = tk.Label(tb, text="Disconnected",
+                                  bg=self.C["panel"], fg=self.C["fgdim"],
+                                  font=("Microsoft YaHei UI", 10))
+        self.conn_lbl.pack(side="left", padx=4)
+
+        # right side
+        ttk.Button(tb, text="Save Log",
+                   style="Norm.TButton",
+                   command=self._save_log).pack(side="right", padx=4, pady=10)
+        ttk.Button(tb, text="Clear Log",
+                   style="Norm.TButton",
+                   command=self._clear_log).pack(side="right", padx=4, pady=10)
+
+        self.stat_lbl = tk.Label(tb, text="TX: 0  RX: 0  ERR: 0",
+                                  bg=self.C["panel"], fg=self.C["fgdim"],
+                                  font=("Microsoft YaHei UI", 10))
+        self.stat_lbl.pack(side="right", padx=16)
+
+    # ── Command panel ─────────────────────────────────────────────
+    def _build_cmd_panel(self, parent):
+        tk.Label(parent, text="COMMAND PANEL",
+                 bg=self.C["panel"], fg=self.C["accent"],
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(
+            pady=(10, 4), padx=12, anchor="w")
+
+        # Scrollable inner frame
+        canvas = tk.Canvas(parent, bg=self.C["panel"],
+                            highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=self.C["panel"])
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(
+                       scrollregion=canvas.bbox("all")))
+        self._cmd_canvas_win = canvas.create_window(
+            (0, 0), window=inner, anchor="nw")
+        # Keep inner frame width synced to canvas width
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(
+                        self._cmd_canvas_win, width=e.width))
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        # Mouse wheel scrolling — only when mouse is over the canvas
+        canvas.bind("<Enter>",
+                    lambda e: canvas.bind_all(
+                        "<MouseWheel>",
+                        lambda ev: canvas.yview_scroll(
+                            int(-1 * (ev.delta / 120)), "units")))
+        canvas.bind("<Leave>",
+                    lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        # ─── Predefined Commands ────
+        self._sh(inner, "RK3562 → MCU  (预定义命令)")
+
+        for cmd, label in [
+            (0x0000, "查询外设状态"),
+            (0x0001, "查询配置参数"),
+        ]:
+            self._cb(inner, f"0x{cmd:04X}  {label}",
+                     lambda c=cmd: self._send_simple(c))
+
+        self._cb(inner, "0x0002  RK3562 心跳 (单次)",
+                 lambda: self._send_simple(0x0002))
+
+        # Heartbeat toggle
+        hb_frame = tk.Frame(inner, bg=self.C["panel"])
+        hb_frame.pack(fill="x", padx=8, pady=1)
+        tk.Checkbutton(
+            hb_frame, text="0x0002  自动心跳 (1 s)",
+            variable=self.hb_rk_enabled,
+            bg=self.C["panel"], fg=self.C["fg"],
+            selectcolor=self.C["card"],
+            activebackground=self.C["panel"],
+            activeforeground=self.C["fg"],
+            font=("Microsoft YaHei UI", 10),
+            anchor="w", justify="left",
+            padx=8, pady=6,
+            command=self._toggle_heartbeat,
+        ).pack(fill="x", anchor="w", padx=2)
+
+        self._cb(inner, "0x0107  清除使用时长",    self._send_clear_usage)
+        self._cb(inner, "0x0108  上报版本号",       self._send_version)
+        self._cb(inner, "0x010A  LED / 护眼屏控制", self._send_led_ctrl)
+        self._cb(inner, "0x010C  电机控制 (步进)",  self._send_motor_step)
+        self._cb(inner, "0x010D  电机控制 (目标值)", self._send_motor_target)
+
+        # ─── ACK Response ────
+        self._sh(inner, "发送 ACK 响应")
+        self._cb(inner, "发送 ACK Ok  (0x03)",  lambda: self._send_ack(FT_ACK_OK))
+        self._cb(inner, "发送 ACK Err (0x04)",  lambda: self._send_ack(FT_ACK_ERR))
+
+        # ─── Manual Frame ────
+        self._sh(inner, "手动发送帧")
+
+        pad = tk.Frame(inner, bg=self.C["panel"])
+        pad.pack(fill="x", padx=8, pady=4)
+        pad.grid_columnconfigure(1, weight=1)
+
+        def row(r, label, widget):
+            tk.Label(pad, text=label, bg=self.C["panel"], fg=self.C["fg"],
+                     font=("Microsoft YaHei UI", 10), width=16, anchor="w").grid(
+                row=r, column=0, sticky="w", pady=5, padx=(0, 8))
+            widget.grid(row=r, column=1, padx=4, pady=5, sticky="ew")
+
+        self.m_cmd = tk.Entry(pad, bg=self.C["card"], fg=self.C["green"],
+                               insertbackground=self.C["green"],
+                               font=("Microsoft YaHei UI", 10), width=8)
+        self.m_cmd.insert(0, "0000")
+
+        self.m_ft  = ttk.Combobox(pad,
+                                   values=["01 - No ACK",
+                                           "02 - Need ACK",
+                                           "03 - ACK Ok",
+                                           "04 - ACK Error"],
+                                   width=22, height=8, state="readonly")
+        self.m_ft.current(0)
+
+        self.m_pl  = tk.Entry(pad, bg=self.C["card"], fg=self.C["green"],
+                               insertbackground=self.C["green"],
+                               font=("Microsoft YaHei UI", 10), width=20)
+
+        row(0, "CMD (hex) :", self.m_cmd)
+        row(1, "Frame Type:", self.m_ft)
+        row(2, "Payload HEX:", self.m_pl)
+
+        self.manual_send_btn = ttk.Button(inner, text="▶  发送手动帧",
+                   style="Accent.TButton",
+                   command=self._send_manual)
+        self.manual_send_btn.pack(
+            fill="x", padx=8, pady=(6, 18), ipady=2)
+
+    def _sh(self, parent, text):
+        """Section header separator."""
+        f = tk.Frame(parent, bg=self.C["panel"])
+        f.pack(fill="x", padx=8, pady=(10, 2))
+        tk.Frame(f, bg=self.C["accent"], height=1).pack(fill="x")
+        tk.Label(f, text=text, bg=self.C["panel"], fg=self.C["accent"],
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", pady=3)
+
+    def _cb(self, parent, text, cmd_func):
+        """Command button."""
+        b = tk.Button(
+            parent, text=text, bg=self.C["card"], fg=self.C["fg"],
+            activebackground=self.C["accent"], activeforeground="#faf8f5",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=372,
+            padx=12, pady=8,
+            command=cmd_func,
+        )
+        b.pack(fill="x", padx=8, pady=1)
+
+    # ── Log panel ─────────────────────────────────────────────────
+    def _build_log_panel(self, parent):
+        hdr = tk.Frame(parent, bg=self.C["bg"])
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text="COMMUNICATION LOG",
+                 bg=self.C["bg"], fg=self.C["accent"],
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
+
+        self.show_tx = tk.BooleanVar(value=True)
+        self.show_rx = tk.BooleanVar(value=True)
+        for text, var, fg in (("TX", self.show_tx, self.C["yellow"]),
+                               ("RX", self.show_rx, self.C["green"])):
+            tk.Checkbutton(hdr, text=text, variable=var,
+                           bg=self.C["bg"], fg=fg, selectcolor=self.C["bg"],
+                           activebackground=self.C["bg"],
+                           font=("Microsoft YaHei UI", 10),
+                           padx=8, pady=6).pack(
+                side="right", padx=4)
+
+        self.log_t = tk.Text(
+            parent, bg=self.C["bg"], fg=self.C["fg"],
+            font=("Microsoft YaHei UI", 10), wrap="none",
+            insertbackground=self.C["fg"],
+            selectbackground=self.C["card"],
+            relief="flat", bd=0,
+            spacing1=1, spacing3=1,
+        )
+        vsb = ttk.Scrollbar(parent, orient="vertical",   command=self.log_t.yview)
+        hsb = ttk.Scrollbar(parent, orient="horizontal", command=self.log_t.xview)
+        self.log_t.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.log_t.pack(fill="both", expand=True)
+
+        # Text tags — normal frames
+        C = self.C
+        self._configure_log_tags()
+        self.log_t.configure(state="disabled")
+
+    # ── Theme switching ───────────────────────────────────────────
+    def _configure_log_tags(self):
+        """Apply / re-apply all Text widget colour tags from current self.C."""
+        C = self.C
+        t = self.log_t
+        t.configure(bg=C["bg"], fg=C["fg"],
+                    insertbackground=C["fg"], selectbackground=C["card"])
+        t.tag_configure("ts",      foreground=C["fgdim"])
+        t.tag_configure("tx_dir",  foreground=C["green"])    # TX  → sage green
+        t.tag_configure("rx_dir",  foreground=C["blue"])     # RX  → muted blue
+        t.tag_configure("err",     foreground=C["accent"])   # error → dusty rose
+        t.tag_configure("info",    foreground=C["yellow"])   # info  → muted gold
+        t.tag_configure("hex",     foreground=C["fgdim"])
+        t.tag_configure("crc_ok",  foreground=C["green"])
+        t.tag_configure("crc_err", foreground=C["accent"])
+        t.tag_configure("decoded", foreground=C["blue"])
+        t.tag_configure("cmd",     foreground=C["fg"],
+                        font=("Microsoft YaHei UI", 10, "bold"))    # CMD bold — most prominent
+        t.tag_configure("hb_dim",  foreground=C["hb"])
+        t.tag_configure("hb_hex",  foreground=C["hb_hex"])
+
+    def _poll_theme(self):
+        """Check OS dark-mode every 3 s; switch palette if it changed."""
+        dark = self._detect_dark_mode()
+        if dark != self._dark:
+            self._apply_theme(dark)
+        self.after(3000, self._poll_theme)
+
+    def _apply_theme(self, dark: bool):
+        """Keep the same palette when the OS theme changes."""
+        self._dark = dark
+        self.C = self.THEME_C.copy()
+        self._retheme_widgets(self.winfo_children(), {})
+        self.configure(bg=self.C["bg"])
+
+        # Re-apply ttk styles with shared colours
+        self._apply_styles()
+
+        # Re-apply log text tags
+        self._configure_log_tags()
+
+        # Update dot colour if disconnected
+        if not (self.ser and self.ser.is_open):
+            self.dot.configure(fg=self.C["fgdim"])
+
+    def _retheme_widgets(self, widgets, remap: dict):
+        """Recursively update bg/fg on classic tk widgets using colour remap."""
+        skip_types = (ttk.Combobox, ttk.Button, ttk.Scrollbar,
+                      ttk.Frame, ttk.Label)
+        for w in widgets:
+            if isinstance(w, skip_types):
+                # ttk widgets are handled by _apply_styles
+                self._retheme_widgets(w.winfo_children(), remap)
+                continue
+            for opt in ("bg", "background", "fg", "foreground",
+                        "insertbackground", "selectbackground",
+                        "troughcolor", "activebackground", "selectcolor"):
+                try:
+                    cur = w.cget(opt)
+                    if isinstance(cur, str):
+                        mapped = remap.get(cur.lower())
+                        if mapped:
+                            w.configure(**{opt: mapped})
+                except Exception:
+                    pass
+            self._retheme_widgets(w.winfo_children(), remap)
+
+    # ── Port management ───────────────────────────────────────────
+    def _refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_cb["values"] = ports
+        if ports and not self.port_var.get():
+            self.port_var.set(ports[0])
+
+    def _toggle_connect(self):
+        if self.ser and self.ser.is_open:
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self):
+        port = self.port_var.get()
+        if not port:
+            messagebox.showerror("Error", "Please select a serial port")
+            return
+        try:
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=int(self.baud_var.get()),
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.05,
+            )
+            self.running = True
+            self.rx_buf.clear()
+            self.rx_thread = threading.Thread(
+                target=self._rx_worker, daemon=True)
+            self.rx_thread.start()
+
+            self.conn_btn.configure(text="DISCONNECT", style="Accent.TButton")
+            self.dot.configure(fg=self.C["green"])
+            self.conn_lbl.configure(
+                text=f"Connected  {port}  {self.baud_var.get()} 8N1",
+                fg=self.C["green"])
+            self._log_info(f"Connected to {port} @ {self.baud_var.get()} bps  8N1")
+        except Exception as exc:
+            messagebox.showerror("Connection Error", str(exc))
+
+    def _disconnect(self):
+        self.running = False
+        self._stop_heartbeat()
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        self.conn_btn.configure(text="CONNECT", style="Green.TButton")
+        self.dot.configure(fg="#302c28" if self._dark else "#d5d0c7")
+        self.conn_lbl.configure(text="Disconnected", fg=self.C["fgdim"])
+        self._log_info("Disconnected")
+
+    # ── RX worker (background thread) ────────────────────────────
+    def _rx_worker(self):
+        while self.running:
+            try:
+                if self.ser and self.ser.is_open:
+                    waiting = self.ser.in_waiting
+                    if waiting:
+                        chunk = self.ser.read(waiting)
+                        if chunk:
+                            self.rx_buf.extend(chunk)
+                            self._drain()
+                else:
+                    time.sleep(0.02)
+            except serial.SerialException as exc:
+                self.log_q.put(("err", f"Serial error: {exc}"))
+                self.running = False
+                break
+            except Exception as exc:
+                self.log_q.put(("err", f"RX error: {exc}"))
+
+    def _drain(self):
+        garbage = bytearray()
+        while self.rx_buf:
+            frame, n = parse_from_buffer(self.rx_buf)
+            if n == 0:
+                # Need more data — flush accumulated garbage first
+                if garbage:
+                    self.log_q.put(("raw", bytes(garbage)))
+                    garbage.clear()
+                break
+            if frame is None:
+                # Skip n unrecognisable bytes — batch them into one raw log entry
+                garbage.extend(self.rx_buf[:n])
+                del self.rx_buf[:n]
+                continue
+            # Valid frame (CRC may still be bad — _log_frame will show it)
+            if garbage:
+                self.log_q.put(("raw", bytes(garbage)))
+                garbage.clear()
+            del self.rx_buf[:n]
+            self.stats["rx"] += 1
+            self.log_q.put(("rx", frame))
+        if garbage:
+            self.log_q.put(("raw", bytes(garbage)))
+            garbage.clear()
+
+    # ── Heartbeat ─────────────────────────────────────────────────
+    def _toggle_heartbeat(self):
+        if self.hb_rk_enabled.get():
+            self.hb_running = True
+            self.hb_rk_thread = threading.Thread(
+                target=self._hb_worker, daemon=True)
+            self.hb_rk_thread.start()
+        else:
+            self._stop_heartbeat()
+
+    def _stop_heartbeat(self):
+        self.hb_running = False
+        self.hb_rk_enabled.set(False)
+
+    def _hb_worker(self):
+        while self.hb_running and self.running:
+            self._send_simple(0x0002)
+            time.sleep(1.0)
+
+    # ── Frame send helpers ────────────────────────────────────────
+    def _next_sc(self) -> int:
+        v = self.sc
+        self.sc = (self.sc + 1) & 0xFFFF
+        return v
+
+    def _send_frame(self, ft: int, cmd: int,
+                    payload: bytes = b'', silent: bool = False) -> bool:
+        if not self.ser or not self.ser.is_open:
+            if not silent:
+                messagebox.showwarning("Not Connected",
+                                       "Please connect to a serial port first.")
+            return False
+        sc    = self._next_sc()
+        frame = build_frame(ft, sc, cmd, payload)
+        try:
+            self.ser.write(frame)
+            self.stats["tx"] += 1
+            if not silent:
+                self.log_q.put(("tx", {
+                    "ft":       ft,
+                    "ft_name":  FT_NAMES.get(ft, f"0x{ft:02X}"),
+                    "sc":       sc,
+                    "cmd":      cmd,
+                    "cmd_name": CMD_TABLE.get(cmd, (f"CMD_0x{cmd:04X}",))[0],
+                    "length":   len(payload),
+                    "payload":  payload,
+                    "crc_ok":   True,
+                    "raw":      frame,
+                }))
+            return True
+        except Exception as exc:
+            self.log_q.put(("err", f"TX error: {exc}"))
+            self.stats["err"] += 1
+            return False
+
+    # ── Predefined send actions ───────────────────────────────────
+    def _send_simple(self, cmd: int, silent: bool = False):
+        _, _, ft = CMD_TABLE.get(cmd, ("", "", FT_NO_ACK))
+        self._send_frame(ft, cmd, silent=silent)
+
+    def _send_clear_usage(self):
+        self._send_frame(FT_NO_ACK, 0x0107, bytes([0xAA]))
+
+    def _send_version(self):
+        d = PayloadDialog(self, "RK3562 版本号  CMD 0x0108", [
+            ("主版本号 (Major)", "1", "0 – 255"),
+            ("次版本号 (Minor)", "0", "0 – 255"),
+            ("补丁版本号 (Patch)","0", "0 – 255"),
+        ])
+        if d.result:
+            try:
+                payload = bytes([int(x, 0) for x in d.result])
+                self._send_frame(FT_NEED_ACK, 0x0108, payload)
+            except (ValueError, OverflowError):
+                messagebox.showerror("Error", "版本号必须为 0-255 整数")
+
+    def _send_led_ctrl(self):
+        d = PayloadDialog(self, "LED 与护眼屏控制  CMD 0x010A", [
+            ("Byte0  LED 开关", "1",  "0x00: 关  0x01: 开"),
+            ("Byte1  亮度",     "2",  "0x01:低  0x02:中  0x03:高"),
+            ("Byte2  色温",     "2",  "0x01:冷光  0x02:常规  0x03:暖光"),
+        ])
+        if d.result:
+            try:
+                payload = bytes([int(x, 0) for x in d.result])
+                self._send_frame(FT_NEED_ACK, 0x010A, payload)
+            except (ValueError, OverflowError):
+                messagebox.showerror("Error", "输入值无效")
+
+    def _send_motor_step(self):
+        d = PayloadDialog(self, "Ultra 电机控制 (步进)  CMD 0x010C", [
+            ("Byte0  方向",          "1",  "0x01:向上  0x02:向下"),
+            ("Byte1  移动距离 (分米)", "10", "整数，如 10"),
+        ])
+        if d.result:
+            try:
+                payload = bytes([int(x, 0) for x in d.result])
+                self._send_frame(FT_NEED_ACK, 0x010C, payload)
+            except (ValueError, OverflowError):
+                messagebox.showerror("Error", "输入值无效")
+
+    def _send_motor_target(self):
+        d = PayloadDialog(self, "Ultra 电机控制 (目标值)  CMD 0x010D", [
+            ("Byte0  目标像距 (分米)", "15", "整数，如 15"),
+        ])
+        if d.result:
+            try:
+                payload = bytes([int(x, 0) for x in d.result])
+                self._send_frame(FT_NEED_ACK, 0x010D, payload)
+            except (ValueError, OverflowError):
+                messagebox.showerror("Error", "输入值无效")
+
+    def _send_ack(self, ft: int):
+        """Send ACK response; user inputs SC of the frame being ACK'd."""
+        sc_str = simpledialog.askstring(
+            "发送 ACK",
+            "输入要 ACK 的 Serial Count（十进制或 0x 十六进制）：",
+            parent=self,
+        )
+        if sc_str is None:
+            return
+        cmd_str = simpledialog.askstring(
+            "发送 ACK",
+            "对应 CMD（十六进制，如 010A）：",
+            parent=self,
+        )
+        if cmd_str is None:
+            return
+        try:
+            target_sc  = int(sc_str.strip(), 0)
+            target_cmd = int(cmd_str.strip(), 16)
+        except ValueError:
+            messagebox.showerror("Error", "输入值无效")
+            return
+        frame = build_frame(ft, target_sc, target_cmd)
+        try:
+            self.ser.write(frame)
+            self.stats["tx"] += 1
+            self.log_q.put(("tx", {
+                "ft":       ft,
+                "ft_name":  FT_NAMES.get(ft),
+                "sc":       target_sc,
+                "cmd":      target_cmd,
+                "cmd_name": CMD_TABLE.get(target_cmd, (f"CMD_0x{target_cmd:04X}",))[0],
+                "length":   0,
+                "payload":  b'',
+                "crc_ok":   True,
+                "raw":      frame,
+            }))
+        except Exception as exc:
+            self.log_q.put(("err", f"TX error: {exc}"))
+
+    def _send_manual(self):
+        try:
+            cmd = int(self.m_cmd.get().strip(), 16)
+        except ValueError:
+            messagebox.showerror("Error", "CMD 格式错误，请输入十六进制，如 010A")
+            return
+        ft = int(self.m_ft.get().split()[0])
+        raw_pl = self.m_pl.get().strip().replace(" ", "")
+        try:
+            payload = bytes.fromhex(raw_pl) if raw_pl else b''
+        except ValueError:
+            messagebox.showerror("Error", "Payload 十六进制格式错误")
+            return
+        self._send_frame(ft, cmd, payload)
+
+    # ── Log / display ─────────────────────────────────────────────
+    def _pump_log(self):
+        """Drain log queue in main thread."""
+        try:
+            while True:
+                kind, data = self.log_q.get_nowait()
+                if kind == "tx":
+                    self._log_frame(data, tx=True)
+                elif kind == "rx":
+                    self._log_frame(data, tx=False)
+                elif kind == "raw":
+                    self._log_raw(data)
+                elif kind == "info":
+                    self._log_info(data)
+                self._update_stats()
+        except queue.Empty:
+            pass
+        self.after(40, self._pump_log)
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    def _write(self, *parts):
+        """parts: [(text, tag), ...]"""
+        self.log_t.configure(state="normal")
+        for text, tag in parts:
+            self.log_t.insert("end", text, tag)
+        self.log_t.insert("end", "\n")
+        self.log_t.configure(state="disabled")
+        self.log_t.see("end")
+
+    def _log_frame(self, f: dict, tx: bool):
+        if tx and not self.show_tx.get():
+            return
+        if not tx and not self.show_rx.get():
+            return
+
+        is_hb    = f["cmd"] in (0x0002, 0x0003)   # heartbeat — visually dimmed
+        dir_str  = "TX ▶" if tx else "◀ RX"
+        crc_str  = "✓ CRC OK" if f["crc_ok"] else "✗ CRC ERR"
+        raw_hex  = " ".join(f'{b:02X}' for b in f["raw"])
+        pl_hex   = f["payload"].hex().upper() if f["payload"] else "(empty)"
+
+        if is_hb:
+            # Single compact line, all in dim color — heartbeats should not dominate
+            self._write(
+                (f"[{self._ts()}] ", "hb_dim"),
+                (f"[{dir_str}] ",   "hb_dim"),
+                (f"CMD:0x{f['cmd']:04X} {f['cmd_name']}  "
+                 f"SC:{f['sc']}  {crc_str}  ", "hb_dim"),
+                (raw_hex, "hb_hex"),
+            )
+            return
+
+        dir_tag  = "tx_dir" if tx else "rx_dir"
+        crc_tag  = "crc_ok" if f["crc_ok"] else "crc_err"
+
+        # Header line
+        self._write(
+            (f"[{self._ts()}] ", "ts"),
+            (f"[{dir_str}] ", dir_tag),
+            (f"CMD:0x{f['cmd']:04X} ", "cmd"),
+            (f"{f['cmd_name']}  ", dir_tag),
+            (f"Type:{f['ft_name']}  SC:{f['sc']}  Len:{f['length']}  ", "ts"),
+            (crc_str, crc_tag),
+        )
+
+        if f["payload"]:
+            self._write(
+                ("         Payload : ", "ts"),
+                (pl_hex,               "hex"),
+            )
+            decoded = decode_payload(f["cmd"], f["payload"])
+            if decoded:
+                for line in decoded.split("\n"):
+                    self._write(
+                        ("         Decoded : ", "ts"),
+                        (line.strip(),          "decoded"),
+                    )
+
+        self._write(
+            ("         Raw HEX : ", "ts"),
+            (raw_hex,               "hex"),
+        )
+        self._write(("", ""))   # blank separator line
+
+    def _log_raw(self, data: bytes):
+        """Log raw bytes that could not be parsed into a valid frame."""
+        if not self.show_rx.get():
+            return
+        raw_hex = " ".join(f"{b:02X}" for b in data)
+        self._write(
+            (f"[{self._ts()}] ", "ts"),
+            ("◀ RX] ", "rx_dir"),
+            ("[RAW / UNPARSED]  ", "err"),
+            (f"{len(data)} bytes: ", "ts"),
+            (raw_hex, "hex"),
+        )
+        self._write(("", ""))
+
+    def _log_info(self, msg: str):
+        self._write(
+            (f"[{self._ts()}] ", "ts"),
+            (f"[INFO]  {msg}",   "info"),
+        )
+
+    def _log_err(self, msg: str):
+        self._write(
+            (f"[{self._ts()}] ", "ts"),
+            (f"[ERROR] {msg}",   "err"),
+        )
+
+    def _update_stats(self):
+        self.stat_lbl.configure(
+            text=f"TX: {self.stats['tx']}  "
+                 f"RX: {self.stats['rx']}  "
+                 f"ERR: {self.stats['err']}")
+
+    def _clear_log(self):
+        self.log_t.configure(state="normal")
+        self.log_t.delete("1.0", "end")
+        self.log_t.configure(state="disabled")
+
+    def _save_log(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"uart_log_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt",
+        )
+        if not path:
+            return
+        content = self.log_t.get("1.0", "end")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            self._log_info(f"Log saved to: {path}")
+        except Exception as exc:
+            messagebox.showerror("Save Error", str(exc))
+
+    # ── Clean exit ────────────────────────────────────────────────
+    def on_close(self):
+        self._disconnect()
+        self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    enable_windows_dpi_awareness()
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
