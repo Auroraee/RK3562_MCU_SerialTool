@@ -15,13 +15,15 @@ dist/
 # Release artifacts
 release/
 *.exe
-!downloads/
-!downloads/*.exe
-!downloads/*.zip
+*.zip
 
-# IDE files
+# Editor files
 .idea/
 .vscode/
+*.iml
+
+# Claude files
+.claude/
 
 # OS files
 .DS_Store
