@@ -6,6 +6,23 @@ RK3562 <-> MCU  UART 通信测试工具
 Simulates RK3562 side for MCU firmware self-testing
 """
 
+# ═══════════════════════════════════════════════════════════════════
+#  DPI Awareness — MUST run before any GUI imports
+# ═══════════════════════════════════════════════════════════════════
+import sys
+if sys.platform == 'win32':
+    import ctypes
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
 try:
     import serial
     import serial.tools.list_ports
@@ -369,10 +386,14 @@ class App(tk.Tk):
         return True   # default to dark if detection fails
 
     def __init__(self):
+        # ── DPI scale factor (must be before super().__init__) ──
+        self.dpi_scale = self._get_dpi_scale() if platform.system() == 'Windows' else 1.0
+
         super().__init__()
         self._apply_windows_dpi_scaling()
-        self.title("RK3562 ↔ MCU  UART Tester  v1.0")
-        self.minsize(960, 640)
+
+        self.title("RK3562 ↔ MCU  UART Tester  v1.1.0")
+        self.minsize(self._s(960), self._s(640))
 
         # Theme — keep the same palette in both OS light/dark modes
         self._dark = self._detect_dark_mode()
@@ -400,14 +421,28 @@ class App(tk.Tk):
         self._pump_log()
         self._poll_theme()   # start system theme watcher
 
+    def _get_dpi_scale(self) -> float:
+        """获取主显示器的 DPI 缩放比例（1.0=100%, 2.0=200%）"""
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+            return dpi / 96.0
+        except Exception:
+            return 1.0
+
+    def _s(self, value: int) -> int:
+        """Scale：把设计像素按 DPI 比例缩放"""
+        return int(value * self.dpi_scale)
+
     def _fit_initial_height(self):
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        width = min(1360, max(980, screen_w - 120))
+        width = min(self._s(1360), max(self._s(980), screen_w - 120))
         button_bottom = self.manual_send_btn.winfo_rooty() + self.manual_send_btn.winfo_height()
         window_top = self.winfo_rooty()
         frame_height = button_bottom - window_top + 20
-        height = min(screen_h - 80, max(720, frame_height))
+        height = min(screen_h - 80, max(self._s(720), frame_height))
         self.geometry(f"{width}x{height}")
 
     def _apply_windows_dpi_scaling(self):
@@ -460,7 +495,7 @@ class App(tk.Tk):
         body.pack(fill="both", expand=True, padx=8, pady=(4, 6))
 
         # Left panel (fixed width)
-        left = tk.Frame(body, bg=self.C["panel"], width=420)
+        left = tk.Frame(body, bg=self.C["panel"], width=self._s(420))
         self.left_panel = left
         left.pack(side="left", fill="y", padx=(0, 6))
         left.pack_propagate(False)
@@ -473,7 +508,7 @@ class App(tk.Tk):
 
     # ── Toolbar ───────────────────────────────────────────────────
     def _build_toolbar(self):
-        tb = tk.Frame(self, bg=self.C["panel"], height=50)
+        tb = tk.Frame(self, bg=self.C["panel"], height=self._s(50))
         tb.pack(fill="x", side="top")
         tb.pack_propagate(False)
 
@@ -650,7 +685,7 @@ class App(tk.Tk):
             parent, text=text, bg=self.C["card"], fg=self.C["fg"],
             activebackground=self.C["accent"], activeforeground="#faf8f5",
             relief="flat", bd=0, cursor="hand2",
-            font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=372,
+            font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=self._s(372),
             padx=12, pady=8,
             command=cmd_func,
         )
@@ -1181,6 +1216,7 @@ class App(tk.Tk):
 #  Entry point
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # DPI awareness already set at file top; kept here for safety
     enable_windows_dpi_awareness()
     app = App()
     app.protocol("WM_DELETE_WINDOW", app.on_close)
