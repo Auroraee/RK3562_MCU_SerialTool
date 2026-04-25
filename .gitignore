@@ -15,6 +15,9 @@ dist/
 # Release artifacts
 release/
 *.exe
+!downloads/
+!downloads/*.exe
+!downloads/*.zip
 
 # IDE files
 .idea/
