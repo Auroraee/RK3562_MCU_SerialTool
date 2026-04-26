@@ -39,7 +39,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.2.0"
 
 
 # ═══════════════════════════════════════════════════════════════════
