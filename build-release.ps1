@@ -118,7 +118,7 @@ if ($statusLines) {
     }
 }
 
-$source = Get-Content -Path $pythonFile -Raw
+$source = Get-Content -Path $pythonFile -Raw -Encoding UTF8
 $versionPattern = 'APP_VERSION = "[^"]+"'
 if ($source -notmatch $versionPattern) {
     throw "APP_VERSION constant not found in rk3562_uart_tester.py"
@@ -126,7 +126,7 @@ if ($source -notmatch $versionPattern) {
 $newSource = [regex]::Replace($source, $versionPattern, "APP_VERSION = `"$normalizedVersion`"", 1)
 
 Invoke-Step "Update app version to $normalizedVersion" {
-    Set-Content -Path $pythonFile -Value $newSource -Encoding UTF8
+    [System.IO.File]::WriteAllText($pythonFile, $newSource, [System.Text.UTF8Encoding]::new($false))
 }
 
 if ($RunTests) {
