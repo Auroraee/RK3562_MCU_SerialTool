@@ -39,7 +39,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -295,17 +295,17 @@ class PayloadDialog(simpledialog.Dialog):
         master.configure(bg=C["panel"])
         self.entries = []
         for i, (label, default, hint) in enumerate(self.fields):
-            tk.Label(master, text=label, bg=C["panel"], fg=C["fg"],
-                     font=("Courier New", 9)).grid(
+            tk.Label(master, text=label, bg=C["panel"], fg="#000000",
+                     font=("Microsoft YaHei UI", 9, "bold")).grid(
                 row=i, column=0, sticky="w", padx=8, pady=4)
-            e = tk.Entry(master, bg=C["card"], fg=C["green"],
-                         insertbackground=C["green"],
-                         font=("Courier New", 10), width=16)
+            e = tk.Entry(master, bg=C["card"], fg="#000000",
+                         insertbackground="#000000",
+                         font=("Microsoft YaHei UI", 10, "bold"), width=16)
             e.insert(0, default)
             e.grid(row=i, column=1, padx=6, pady=4)
             if hint:
-                tk.Label(master, text=hint, bg=C["panel"], fg=C["fgdim"],
-                         font=("Courier New", 8)).grid(
+                tk.Label(master, text=hint, bg=C["panel"], fg="#000000",
+                         font=("Microsoft YaHei UI", 8, "bold")).grid(
                     row=i, column=2, padx=6, sticky="w")
             self.entries.append(e)
         return self.entries[0] if self.entries else None
@@ -339,7 +339,6 @@ class App(tk.Tk):
     @staticmethod
     def _detect_dark_mode() -> bool:
         """Return True if the OS is currently in dark mode."""
-        import platform
         system = platform.system()
         try:
             if system == "Windows":
@@ -402,7 +401,6 @@ class App(tk.Tk):
         self._update_cmd_scroll_state()
         self._refresh_ports()
         self._pump_log()
-        self._poll_theme()   # start system theme watcher
 
     def _get_dpi_scale(self) -> float:
         """获取主显示器的 DPI 缩放比例（1.0=100%, 2.0=200%）"""
@@ -521,7 +519,7 @@ class App(tk.Tk):
         self.conn_btn.pack(side="left", padx=(18, 4), pady=10)
 
         self.dot = tk.Label(tb, text="●", bg=self.C["panel"],
-                             fg="#333", font=("Courier New", 18))
+                             fg="#333", font=("Microsoft YaHei UI", 18))
         self.dot.pack(side="left", padx=2)
         self.conn_lbl = tk.Label(tb, text="Disconnected",
                                   bg=self.C["panel"], fg=self.C["fgdim"],
@@ -677,11 +675,11 @@ class App(tk.Tk):
 
     def _bind_cmd_mousewheel(self, _event=None):
         if self._cmd_scroll_overflows():
-            self.cmd_canvas.bind_all("<MouseWheel>", self._on_cmd_mousewheel)
+            self.cmd_canvas.bind("<MouseWheel>", self._on_cmd_mousewheel)
 
     def _unbind_cmd_mousewheel(self, _event=None):
         if hasattr(self, "cmd_canvas"):
-            self.cmd_canvas.unbind_all("<MouseWheel>")
+            self.cmd_canvas.unbind("<MouseWheel>")
 
     def _on_cmd_mousewheel(self, event):
         if self._cmd_scroll_overflows():
@@ -704,8 +702,8 @@ class App(tk.Tk):
     def _cb(self, parent, text, cmd_func):
         """Command button."""
         b = tk.Button(
-            parent, text=text, bg=self.C["card"], fg=self.C["fg"],
-            activebackground=self.C["accent"], activeforeground="#faf8f5",
+            parent, text=text, bg=self.C["card"], fg="#000000",
+            activebackground=self.C["accent"], activeforeground="#000000",
             relief="flat", bd=0, cursor="hand2",
             font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=self._s(232),
             padx=12, pady=8,
@@ -770,18 +768,10 @@ class App(tk.Tk):
         t.tag_configure("hb_dim",  foreground=C["hb"])
         t.tag_configure("hb_hex",  foreground=C["hb_hex"])
 
-    def _poll_theme(self):
-        """Check OS dark-mode every 3 s; switch palette if it changed."""
-        dark = self._detect_dark_mode()
-        if dark != self._dark:
-            self._apply_theme(dark)
-        self.after(3000, self._poll_theme)
-
     def _apply_theme(self, dark: bool):
         """Keep the same palette when the OS theme changes."""
         self._dark = dark
         self.C = self.THEME_C.copy()
-        self._retheme_widgets(self.winfo_children(), {})
         self.configure(bg=self.C["bg"])
 
         # Re-apply ttk styles with shared colours
@@ -794,27 +784,15 @@ class App(tk.Tk):
         if not (self.ser and self.ser.is_open):
             self.dot.configure(fg=self.C["fgdim"])
 
-    def _retheme_widgets(self, widgets, remap: dict):
-        """Recursively update bg/fg on classic tk widgets using colour remap."""
+    def _retheme_widgets(self, widgets):
+        """Recursively update bg/fg on classic tk widgets."""
         skip_types = (ttk.Combobox, ttk.Button, ttk.Scrollbar,
                       ttk.Frame, ttk.Label)
         for w in widgets:
             if isinstance(w, skip_types):
-                # ttk widgets are handled by _apply_styles
-                self._retheme_widgets(w.winfo_children(), remap)
+                self._retheme_widgets(w.winfo_children())
                 continue
-            for opt in ("bg", "background", "fg", "foreground",
-                        "insertbackground", "selectbackground",
-                        "troughcolor", "activebackground", "selectcolor"):
-                try:
-                    cur = w.cget(opt)
-                    if isinstance(cur, str):
-                        mapped = remap.get(cur.lower())
-                        if mapped:
-                            w.configure(**{opt: mapped})
-                except Exception:
-                    pass
-            self._retheme_widgets(w.winfo_children(), remap)
+            self._retheme_widgets(w.winfo_children())
 
     # ── Port management ───────────────────────────────────────────
     def _refresh_ports(self):
@@ -868,7 +846,7 @@ class App(tk.Tk):
                 pass
             self.ser = None
         self.conn_btn.configure(text="CONNECT", style="Green.TButton")
-        self.dot.configure(fg="#302c28" if self._dark else "#d5d0c7")
+        self.dot.configure(fg=self.C["fgdim"])
         self.conn_lbl.configure(text="Disconnected", fg=self.C["fgdim"])
         self._log_info("Disconnected")
 
@@ -921,6 +899,8 @@ class App(tk.Tk):
     # ── Heartbeat ─────────────────────────────────────────────────
     def _toggle_heartbeat(self):
         if self.hb_rk_enabled.get():
+            if self.hb_rk_thread and self.hb_rk_thread.is_alive():
+                return
             self.hb_running = True
             self.hb_rk_thread = threading.Thread(
                 target=self._hb_worker, daemon=True)

@@ -1,3 +1,46 @@
+<#
+.SYNOPSIS
+Build and optionally publish a Windows release for RK3562 MCU UART Validation Tool.
+
+.DESCRIPTION
+By default, this script only builds local release artifacts.
+Use -Push to commit source changes, push main, and create/push the release tag.
+Use -CreateRelease together with -Push to publish a GitHub release.
+
+.PARAMETER Version
+Release version in the form 1.2.0 or v1.2.0.
+
+.PARAMETER Notes
+Optional GitHub release notes. If omitted, default notes are generated.
+
+.PARAMETER RunTests
+Runs python -m py_compile before packaging.
+
+.PARAMETER Push
+Stages allowed files, creates a release commit, pushes main, and creates/pushes the release tag.
+
+.PARAMETER CreateRelease
+Creates the GitHub release for the requested tag. Requires -Push.
+
+.PARAMETER WhatIf
+Prints the workflow steps without modifying files or publishing anything.
+
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1 -Version 1.1.2
+Build local artifacts only.
+
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1 -Version 1.1.2 -RunTests
+Build local artifacts after a syntax check.
+
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1 -Version 1.1.2 -RunTests -Push
+Build, commit, push main, and push tag v1.1.2.
+
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1 -Version 1.1.2 -RunTests -Push -CreateRelease
+Build, push, and publish the GitHub release.
+#>
 param(
     [Parameter(Mandatory = $true)]
     [string]$Version,
@@ -158,41 +201,38 @@ Invoke-Step "Remove generated build artifacts" {
     Remove-Item -Path $buildDir, $distDir, $specFile -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-Invoke-Step "Fetch remote tags" {
-    Invoke-CheckedCommand $gitCmd @("fetch", "--tags", "origin")
-}
+if ($Push -or $CreateRelease) {
+    Invoke-Step "Fetch remote tags" {
+        Invoke-CheckedCommand $gitCmd @("fetch", "--tags", "origin")
+    }
 
-$localTagExists = & $gitCmd rev-parse -q --verify "refs/tags/$tag" 2>$null
-if ($LASTEXITCODE -eq 0 -and $localTagExists) {
-    throw "Tag $tag already exists locally"
-}
+    $localTagExists = & $gitCmd rev-parse -q --verify "refs/tags/$tag" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $localTagExists) {
+        throw "Tag $tag already exists locally"
+    }
 
-$remoteTagExists = & $gitCmd ls-remote --tags origin $tag
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to query remote tags"
-}
-if (-not [string]::IsNullOrWhiteSpace($remoteTagExists)) {
-    throw "Tag $tag already exists on origin"
-}
-
-& $ghCmd release view $tag 1>$null 2>$null
-if ($LASTEXITCODE -eq 0) {
-    throw "GitHub release $tag already exists"
-}
-
-Invoke-Step "Show files to commit" {
-    & $gitCmd status --short -- $pythonFile $iconFile (Join-Path $repoRoot "a.png") (Join-Path $repoRoot "build-release.ps1")
+    $remoteTagExists = & $gitCmd ls-remote --tags origin $tag
     if ($LASTEXITCODE -ne 0) {
-        throw "Unable to show pending source changes"
+        throw "Unable to query remote tags"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($remoteTagExists)) {
+        throw "Tag $tag already exists on origin"
     }
 }
 
-Invoke-Step "Commit source changes" {
-    Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, (Join-Path $repoRoot "a.png"), (Join-Path $repoRoot "build-release.ps1"))
-    Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
-}
-
 if ($Push) {
+    Invoke-Step "Show files to commit" {
+        & $gitCmd status --short -- $pythonFile $iconFile (Join-Path $repoRoot "a.png") (Join-Path $repoRoot "build-release.ps1")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to show pending source changes"
+        }
+    }
+
+    Invoke-Step "Commit source changes" {
+        Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, (Join-Path $repoRoot "a.png"), (Join-Path $repoRoot "build-release.ps1"))
+        Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
+    }
+
     Invoke-Step "Push branch $mainBranch" {
         Invoke-CheckedCommand $gitCmd @("push", "origin", $mainBranch)
     }
@@ -201,15 +241,16 @@ if ($Push) {
         Invoke-CheckedCommand $gitCmd @("tag", "-a", $tag, "-m", "Release $tag")
         Invoke-CheckedCommand $gitCmd @("push", "origin", $tag)
     }
-} else {
-    Invoke-Step "Create local release tag $tag" {
-        Invoke-CheckedCommand $gitCmd @("tag", "-a", $tag, "-m", "Release $tag")
-    }
 }
 
 if ($CreateRelease) {
     if (-not $Push) {
         throw "-CreateRelease requires -Push so the tag exists on GitHub"
+    }
+
+    & $ghCmd release view $tag 1>$null 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        throw "GitHub release $tag already exists"
     }
 
     Invoke-Step "Create GitHub release $tag" {
