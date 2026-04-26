@@ -18,7 +18,6 @@ $iconFile = Join-Path $repoRoot "a.ico"
 $releaseDir = Join-Path $repoRoot "release"
 $distDir = Join-Path $repoRoot "dist"
 $buildDir = Join-Path $repoRoot "build"
-$hookDir = Join-Path $repoRoot "packaging_hooks"
 $mainBranch = "main"
 $appName = "rk3562_mcu_uart_validation_tool"
 $appTitle = "RK3562 MCU UART Validation Tool"
@@ -111,8 +110,7 @@ if ($statusLines) {
         " M a.ico",
         " M a.png",
         " M build-release.ps1",
-        "?? build-release.ps1",
-        "?? packaging_hooks/"
+        "?? build-release.ps1"
     )
     $unexpected = @($statusLines | Where-Object { $_ -notin $allowedDirty })
     if ($unexpected.Count -gt 0) {
@@ -144,7 +142,6 @@ Invoke-Step "Build Windows executable" {
         "--onefile",
         "--windowed",
         "--icon", $iconFile,
-        "--additional-hooks-dir", $hookDir,
         "--name", $appName,
         $pythonFile
     )
@@ -184,14 +181,14 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 Invoke-Step "Show files to commit" {
-    & $gitCmd status --short -- $pythonFile $iconFile (Join-Path $repoRoot "a.png") (Join-Path $repoRoot "build-release.ps1") $hookDir
+    & $gitCmd status --short -- $pythonFile $iconFile (Join-Path $repoRoot "a.png") (Join-Path $repoRoot "build-release.ps1")
     if ($LASTEXITCODE -ne 0) {
         throw "Unable to show pending source changes"
     }
 }
 
 Invoke-Step "Commit source changes" {
-    Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, (Join-Path $repoRoot "a.png"), (Join-Path $repoRoot "build-release.ps1"), $hookDir)
+    Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, (Join-Path $repoRoot "a.png"), (Join-Path $repoRoot "build-release.ps1"))
     Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
 }
 
