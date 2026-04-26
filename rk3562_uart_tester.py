@@ -39,11 +39,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  CRC8  (Polynomial 0x07, Init 0x00, No Reflect)
+#  CRC-8 Calculation (matches MCU's Crc_CalculateCRC8 with SAE-J1850 settings)
 # ═══════════════════════════════════════════════════════════════════
 # CRC-8/SAE-J1850  Poly=0x1D  Init=0xFF  XorOut=0xFF
 # Lookup table matches MCU's Cal_Crc8Tab exactly
@@ -67,7 +67,6 @@ _CRC8_TABLE = [
 ]
 
 def crc8(data: bytes) -> int:
-    """CRC-8/SAE-J1850: matches MCU Crc_CalculateCRC8(..., IsFirstCall=TRUE)."""
     crc = 0xFF                          # CRC_INITVALUE8
     for byte in data:
         crc = _CRC8_TABLE[crc ^ byte]
@@ -227,8 +226,23 @@ def decode_payload(cmd: int, payload: bytes) -> str:
             return f"磁栅类型: {type_map.get(payload[0], f'0x{payload[0]:02X}')}"
 
         elif cmd == 0x0103 and len(payload) >= 2:
-            return (f"人在门限: {payload[0]}  无人延时: {payload[1]} s  "
-                    f"门参数: {payload[2:].hex().upper() if len(payload) > 2 else 'N/A'}")
+            parts = [
+                f"门数: {payload[0]}",
+                f"无人延时: {payload[1]} s",
+            ]
+            for i in range(9):
+                off = 2 + i * 2
+                if off + 1 >= len(payload):
+                    break
+                motion, static = payload[off], payload[off + 1]
+                if motion == 0xFF and static == 0xFF:
+                    parts.append(f"门{i}: 未使用")
+                else:
+                    parts.append(
+                        f"门{i}: 运动灵敏度={motion}  "
+                        f"静止灵敏度={static}"
+                    )
+            return "\n                ".join(parts)
 
         elif cmd in (0x0104, 0x0105) and len(payload) >= 2:
             sensor_id = "霍尔1" if cmd == 0x0104 else "霍尔2"

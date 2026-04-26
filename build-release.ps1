@@ -192,7 +192,9 @@ for s in sizes:
     if s <= max(png.size):
         imgs.append(png.resize((s, s), Image.Resampling.LANCZOS))
 if imgs:
-    imgs[0].save(r'$iconFile', format='ICO', sizes=[(i.width, i.height) for i in imgs])
+    imgs[-1].save(r'$iconFile', format='ICO',
+                 sizes=[(i.width, i.height) for i in imgs],
+                 append_images=imgs[:-1])
 "@ | Set-Content -Path $tmpPy -Encoding UTF8
     try {
         Invoke-CheckedCommand $pythonCmd @($tmpPy)
