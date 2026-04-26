@@ -57,6 +57,7 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repoRoot
 
 $pythonFile = Join-Path $repoRoot "rk3562_uart_tester.py"
+$pngFile = Join-Path $repoRoot "a.png"
 $iconFile = Join-Path $repoRoot "a.ico"
 $releaseDir = Join-Path $repoRoot "release"
 $distDir = Join-Path $repoRoot "dist"
@@ -178,6 +179,28 @@ if ($RunTests) {
     }
 }
 
+Invoke-Step "Convert PNG icon to ICO" {
+    $tmpPy = [System.IO.Path]::GetTempFileName() + ".py"
+    @"
+from PIL import Image
+png = Image.open(r'$pngFile')
+if png.mode != 'RGBA':
+    png = png.convert('RGBA')
+sizes = [16, 32, 48, 64, 128, 256]
+imgs = []
+for s in sizes:
+    if s <= max(png.size):
+        imgs.append(png.resize((s, s), Image.Resampling.LANCZOS))
+if imgs:
+    imgs[0].save(r'$iconFile', format='ICO', sizes=[(i.width, i.height) for i in imgs])
+"@ | Set-Content -Path $tmpPy -Encoding UTF8
+    try {
+        Invoke-CheckedCommand $pythonCmd @($tmpPy)
+    } finally {
+        Remove-Item -Path $tmpPy -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Invoke-Step "Build Windows executable" {
     Invoke-CheckedCommand $pyinstallerCmd @(
         "--noconfirm",
@@ -222,14 +245,14 @@ if ($Push -or $CreateRelease) {
 
 if ($Push) {
     Invoke-Step "Show files to commit" {
-        & $gitCmd status --short -- $pythonFile $iconFile (Join-Path $repoRoot "a.png") (Join-Path $repoRoot "build-release.ps1")
+        & $gitCmd status --short -- $pythonFile $iconFile $pngFile (Join-Path $repoRoot "build-release.ps1")
         if ($LASTEXITCODE -ne 0) {
             throw "Unable to show pending source changes"
         }
     }
 
     Invoke-Step "Commit source changes" {
-        Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, (Join-Path $repoRoot "a.png"), (Join-Path $repoRoot "build-release.ps1"))
+        Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, $pngFile, (Join-Path $repoRoot "build-release.ps1"))
         Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
     }
 
