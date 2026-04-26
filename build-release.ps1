@@ -18,10 +18,11 @@ $iconFile = Join-Path $repoRoot "a.ico"
 $releaseDir = Join-Path $repoRoot "release"
 $distDir = Join-Path $repoRoot "dist"
 $buildDir = Join-Path $repoRoot "build"
-$specFile = Join-Path $repoRoot "rk3562_uart_tester.spec"
+$hookDir = Join-Path $repoRoot "packaging_hooks"
 $mainBranch = "main"
 $appName = "rk3562_mcu_uart_validation_tool"
 $appTitle = "RK3562 MCU UART Validation Tool"
+$specFile = Join-Path $repoRoot "$appName.spec"
 
 if ($Version -notmatch '^v?\d+\.\d+\.\d+$') {
     throw "Version must look like 1.2.0 or v1.2.0"
@@ -105,7 +106,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Unable to read git status"
 }
 if ($statusLines) {
-    $allowedDirty = @(" M rk3562_uart_tester.py", "?? build-release.ps1", " M build-release.ps1")
+    $allowedDirty = @(
+        " M rk3562_uart_tester.py",
+        " M a.ico",
+        " M a.png",
+        " M build-release.ps1",
+        "?? build-release.ps1",
+        "?? packaging_hooks/"
+    )
     $unexpected = @($statusLines | Where-Object { $_ -notin $allowedDirty })
     if ($unexpected.Count -gt 0) {
         throw "Working tree has unrelated changes:`n$($unexpected -join "`n")"
@@ -136,6 +144,7 @@ Invoke-Step "Build Windows executable" {
         "--onefile",
         "--windowed",
         "--icon", $iconFile,
+        "--additional-hooks-dir", $hookDir,
         "--name", $appName,
         $pythonFile
     )
@@ -175,14 +184,14 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 Invoke-Step "Show files to commit" {
-    & $gitCmd status --short -- $pythonFile (Join-Path $repoRoot "build-release.ps1")
+    & $gitCmd status --short -- $pythonFile $iconFile (Join-Path $repoRoot "a.png") (Join-Path $repoRoot "build-release.ps1") $hookDir
     if ($LASTEXITCODE -ne 0) {
         throw "Unable to show pending source changes"
     }
 }
 
 Invoke-Step "Commit source changes" {
-    Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, (Join-Path $repoRoot "build-release.ps1"))
+    Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, (Join-Path $repoRoot "a.png"), (Join-Path $repoRoot "build-release.ps1"), $hookDir)
     Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
 }
 

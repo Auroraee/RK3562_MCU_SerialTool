@@ -10,8 +10,8 @@ Simulates RK3562 side for MCU firmware self-testing
 #  DPI Awareness — MUST run before any GUI imports
 # ═══════════════════════════════════════════════════════════════════
 import sys
+import ctypes
 if sys.platform == 'win32':
-    import ctypes
     try:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
@@ -34,33 +34,12 @@ import queue
 import threading
 import datetime
 import time
-import os
 import platform
-import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.1.1"
-
-
-def enable_windows_dpi_awareness():
-    if platform.system() != "Windows":
-        return
-    try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
+APP_VERSION = "1.2.1"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -143,7 +122,7 @@ CMD_TABLE = {
 def build_frame(frame_type: int, serial_count: int, cmd: int,
                 payload: bytes = b'') -> bytes:
     """
-    Frame layout (little-endian multi-byte fields):
+    Frame layout (big-endian multi-byte fields):
       Header(1) | FrameType(1) | SerialCount(2) | CMD(2) |
       Length(2) | Payload(n) | CRC8(1) | End(1)
     CRC8 covers everything from Header through Payload.
@@ -420,6 +399,7 @@ class App(tk.Tk):
         self._build_ui()
         self.update_idletasks()
         self._fit_initial_height()
+        self._update_cmd_scroll_state()
         self._refresh_ports()
         self._pump_log()
         self._poll_theme()   # start system theme watcher
@@ -441,7 +421,7 @@ class App(tk.Tk):
     def _fit_initial_height(self):
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        width = min(self._s(1360), max(self._s(980), screen_w - 120))
+        width = min(self._s(1080), max(self._s(980), screen_w - 120))
         button_bottom = self.manual_send_btn.winfo_rooty() + self.manual_send_btn.winfo_height()
         window_top = self.winfo_rooty()
         frame_height = button_bottom - window_top + 20
@@ -498,7 +478,7 @@ class App(tk.Tk):
         body.pack(fill="both", expand=True, padx=8, pady=(4, 6))
 
         # Left panel (fixed width)
-        left = tk.Frame(body, bg=self.C["panel"], width=self._s(420))
+        left = tk.Frame(body, bg=self.C["panel"], width=self._s(280))
         self.left_panel = left
         left.pack(side="left", fill="y", padx=(0, 6))
         left.pack_propagate(False)
@@ -568,31 +548,27 @@ class App(tk.Tk):
                  font=("Microsoft YaHei UI", 12, "bold")).pack(
             pady=(10, 4), padx=12, anchor="w")
 
-        # Scrollable inner frame
+        # Scrollable inner frame. Scrolling is enabled only when commands overflow.
         canvas = tk.Canvas(parent, bg=self.C["panel"],
                             highlightthickness=0, bd=0)
         vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=self.C["panel"])
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(
-                       scrollregion=canvas.bbox("all")))
+        self.cmd_canvas = canvas
+        self.cmd_scrollbar = vsb
+        self.cmd_inner = inner
+        inner.bind("<Configure>", lambda e: self._update_cmd_scroll_state())
         self._cmd_canvas_win = canvas.create_window(
             (0, 0), window=inner, anchor="nw")
         # Keep inner frame width synced to canvas width
         canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(
-                        self._cmd_canvas_win, width=e.width))
+                    lambda e: (
+                        canvas.itemconfig(self._cmd_canvas_win, width=e.width),
+                        self._update_cmd_scroll_state()))
         canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        # Mouse wheel scrolling — only when mouse is over the canvas
-        canvas.bind("<Enter>",
-                    lambda e: canvas.bind_all(
-                        "<MouseWheel>",
-                        lambda ev: canvas.yview_scroll(
-                            int(-1 * (ev.delta / 120)), "units")))
-        canvas.bind("<Leave>",
-                    lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Mouse wheel scrolling — only when mouse is over an overflowing canvas
+        canvas.bind("<Enter>", self._bind_cmd_mousewheel)
+        canvas.bind("<Leave>", self._unbind_cmd_mousewheel)
 
         # ─── Predefined Commands ────
         self._sh(inner, "RK3562 → MCU  (预定义命令)")
@@ -610,17 +586,11 @@ class App(tk.Tk):
         # Heartbeat toggle
         hb_frame = tk.Frame(inner, bg=self.C["panel"])
         hb_frame.pack(fill="x", padx=8, pady=1)
-        tk.Checkbutton(
+        self._checkbutton(
             hb_frame, text="0x0002  自动心跳 (1 s)",
             variable=self.hb_rk_enabled,
-            bg=self.C["panel"], fg=self.C["fg"],
-            selectcolor=self.C["card"],
-            activebackground=self.C["panel"],
-            activeforeground=self.C["fg"],
-            font=("Microsoft YaHei UI", 10),
-            anchor="w", justify="left",
-            padx=8, pady=6,
             command=self._toggle_heartbeat,
+            bg=self.C["panel"], fg=self.C["fg"],
         ).pack(fill="x", anchor="w", padx=2)
 
         self._cb(inner, "0x0107  清除使用时长",    self._send_clear_usage)
@@ -631,7 +601,7 @@ class App(tk.Tk):
 
         # ─── ACK Response ────
         self._sh(inner, "发送 ACK 响应")
-        self._cb(inner, "发送 ACK Ok  (0x03)",  lambda: self._send_ack(FT_ACK_OK))
+        self._cb(inner, "发送 ACK OK  (0x03)",  lambda: self._send_ack(FT_ACK_OK))
         self._cb(inner, "发送 ACK Err (0x04)",  lambda: self._send_ack(FT_ACK_ERR))
 
         # ─── Manual Frame ────
@@ -643,7 +613,7 @@ class App(tk.Tk):
 
         def row(r, label, widget):
             tk.Label(pad, text=label, bg=self.C["panel"], fg=self.C["fg"],
-                     font=("Microsoft YaHei UI", 10), width=16, anchor="w").grid(
+                     font=("Microsoft YaHei UI", 10), width=11, anchor="w").grid(
                 row=r, column=0, sticky="w", pady=5, padx=(0, 8))
             widget.grid(row=r, column=1, padx=4, pady=5, sticky="ew")
 
@@ -657,12 +627,12 @@ class App(tk.Tk):
                                            "02 - Need ACK",
                                            "03 - ACK Ok",
                                            "04 - ACK Error"],
-                                   width=22, height=8, state="readonly")
+                                   width=14, height=8, state="readonly")
         self.m_ft.current(0)
 
         self.m_pl  = tk.Entry(pad, bg=self.C["card"], fg=self.C["green"],
                                insertbackground=self.C["green"],
-                               font=("Microsoft YaHei UI", 10), width=20)
+                               font=("Microsoft YaHei UI", 10), width=12)
 
         row(0, "CMD (hex) :", self.m_cmd)
         row(1, "Frame Type:", self.m_ft)
@@ -682,13 +652,62 @@ class App(tk.Tk):
         tk.Label(f, text=text, bg=self.C["panel"], fg=self.C["accent"],
                  font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", pady=3)
 
+    def _cmd_scroll_overflows(self) -> bool:
+        if not hasattr(self, "cmd_canvas"):
+            return False
+        return self.cmd_inner.winfo_reqheight() > self.cmd_canvas.winfo_height()
+
+    def _update_cmd_scroll_state(self):
+        if not hasattr(self, "cmd_canvas"):
+            return
+        canvas = self.cmd_canvas
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        if self._cmd_scroll_overflows():
+            if not self.cmd_scrollbar.winfo_ismapped():
+                canvas.pack_forget()
+                self.cmd_scrollbar.pack(side="right", fill="y")
+                canvas.pack(side="left", fill="both", expand=True)
+            canvas.configure(yscrollcommand=self.cmd_scrollbar.set)
+        else:
+            self._unbind_cmd_mousewheel()
+            if self.cmd_scrollbar.winfo_ismapped():
+                self.cmd_scrollbar.pack_forget()
+            canvas.yview_moveto(0)
+            canvas.configure(yscrollcommand=lambda *args: None)
+
+    def _bind_cmd_mousewheel(self, _event=None):
+        if self._cmd_scroll_overflows():
+            self.cmd_canvas.bind_all("<MouseWheel>", self._on_cmd_mousewheel)
+
+    def _unbind_cmd_mousewheel(self, _event=None):
+        if hasattr(self, "cmd_canvas"):
+            self.cmd_canvas.unbind_all("<MouseWheel>")
+
+    def _on_cmd_mousewheel(self, event):
+        if self._cmd_scroll_overflows():
+            self.cmd_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _checkbutton(self, parent, text, variable, command=None, bg=None, fg=None):
+        """Large hit-target Checkbutton for toolbar and command-panel toggles."""
+        bg = bg or self.C["bg"]
+        fg = fg or self.C["fg"]
+        return tk.Checkbutton(
+            parent, text=text, variable=variable, command=command,
+            bg=bg, fg=fg, selectcolor=self.C["card"],
+            activebackground=bg, activeforeground=fg,
+            font=("Microsoft YaHei UI", 11),
+            anchor="w", justify="left",
+            padx=12, pady=9,
+            cursor="hand2",
+        )
+
     def _cb(self, parent, text, cmd_func):
         """Command button."""
         b = tk.Button(
             parent, text=text, bg=self.C["card"], fg=self.C["fg"],
             activebackground=self.C["accent"], activeforeground="#faf8f5",
             relief="flat", bd=0, cursor="hand2",
-            font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=self._s(372),
+            font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=self._s(232),
             padx=12, pady=8,
             command=cmd_func,
         )
@@ -706,11 +725,8 @@ class App(tk.Tk):
         self.show_rx = tk.BooleanVar(value=True)
         for text, var, fg in (("TX", self.show_tx, self.C["yellow"]),
                                ("RX", self.show_rx, self.C["green"])):
-            tk.Checkbutton(hdr, text=text, variable=var,
-                           bg=self.C["bg"], fg=fg, selectcolor=self.C["bg"],
-                           activebackground=self.C["bg"],
-                           font=("Microsoft YaHei UI", 10),
-                           padx=8, pady=6).pack(
+            self._checkbutton(hdr, text=text, variable=var,
+                              bg=self.C["bg"], fg=fg).pack(
                 side="right", padx=4)
 
         self.log_t = tk.Text(
@@ -1219,8 +1235,6 @@ class App(tk.Tk):
 #  Entry point
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # DPI awareness already set at file top; kept here for safety
-    enable_windows_dpi_awareness()
     app = App()
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()
