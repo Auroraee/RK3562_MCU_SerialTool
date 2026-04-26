@@ -248,8 +248,12 @@ if ($CreateRelease) {
         throw "-CreateRelease requires -Push so the tag exists on GitHub"
     }
 
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
     & $ghCmd release view $tag 1>$null 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
+    if ($exit -eq 0) {
         throw "GitHub release $tag already exists"
     }
 
