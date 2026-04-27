@@ -39,7 +39,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -583,9 +583,6 @@ class App(tk.Tk):
                         self._update_cmd_scroll_state()))
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
-        # Mouse wheel scrolling — only when mouse is over an overflowing canvas
-        canvas.bind("<Enter>", self._bind_cmd_mousewheel)
-        canvas.bind("<Leave>", self._unbind_cmd_mousewheel)
 
         # ─── Predefined Commands ────
         self._sh(inner, "RK3562 → MCU  (预定义命令)")
@@ -661,6 +658,10 @@ class App(tk.Tk):
         self.manual_send_btn.pack(
             fill="x", padx=8, pady=(6, 18), ipady=2)
 
+        # Bind mouse wheel to canvas and every inner widget so scrolling works
+        # anywhere in the left panel, not just over the scrollbar.
+        self._bind_all_cmd_mousewheel()
+
     def _sh(self, parent, text):
         """Section header separator."""
         f = tk.Frame(parent, bg=self.C["panel"])
@@ -686,23 +687,24 @@ class App(tk.Tk):
                 canvas.pack(side="left", fill="both", expand=True)
             canvas.configure(yscrollcommand=self.cmd_scrollbar.set)
         else:
-            self._unbind_cmd_mousewheel()
             if self.cmd_scrollbar.winfo_ismapped():
                 self.cmd_scrollbar.pack_forget()
             canvas.yview_moveto(0)
             canvas.configure(yscrollcommand=lambda *args: None)
 
-    def _bind_cmd_mousewheel(self, _event=None):
-        if self._cmd_scroll_overflows():
-            self.cmd_canvas.bind("<MouseWheel>", self._on_cmd_mousewheel)
-
-    def _unbind_cmd_mousewheel(self, _event=None):
-        if hasattr(self, "cmd_canvas"):
-            self.cmd_canvas.unbind("<MouseWheel>")
+    def _bind_all_cmd_mousewheel(self):
+        """Recursively bind mouse wheel to canvas and all descendant widgets."""
+        def _recursive_bind(widget):
+            widget.bind("<MouseWheel>", self._on_cmd_mousewheel)
+            for child in widget.winfo_children():
+                _recursive_bind(child)
+        for root in (self.cmd_canvas, self.cmd_inner):
+            _recursive_bind(root)
 
     def _on_cmd_mousewheel(self, event):
         if self._cmd_scroll_overflows():
             self.cmd_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
 
     def _checkbutton(self, parent, text, variable, command=None, bg=None, fg=None):
         """Large hit-target Checkbutton for toolbar and command-panel toggles."""
