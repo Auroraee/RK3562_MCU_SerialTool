@@ -39,7 +39,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -200,13 +200,18 @@ def decode_payload(cmd: int, payload: bytes) -> str:
             }
             brightness = {1: "低亮度", 2: "中亮度", 3: "高亮度"}
             color_temp  = {1: "冷光", 2: "常规", 3: "暖光"}
-            usage_time  = (payload[6] << 8) | payload[7]
+            raw_time    = (payload[6] << 8) | payload[7]
+            person      = (raw_time >> 15) & 1
+            usage_time  = raw_time & 0x7FFF
             parts = [
                 f"设备状态: {state_map.get(payload[0], f'0x{payload[0]:02X}')}",
                 f"LED: {'开' if payload[1] == 0x00 else '关'}",
                 f"亮度: {brightness.get(payload[2], f'0x{payload[2]:02X}')}",
                 f"色温: {color_temp.get(payload[3], f'0x{payload[3]:02X}')}",
-                f"使用时长: {usage_time} s",
+                f"电机: {'开启' if payload[4] == 0x01 else ('关闭' if payload[4] == 0x00 else f'0x{payload[4]:02X}')}",
+                f"像距: {payload[5]} 分米",
+                f"人在: {'是' if person == 1 else '否'}",
+                f"使用时长: {usage_time} 分钟",
                 f"霍尔1 (LED): {'合盖/关灯' if payload[8] == 0x01 else '开盖/开灯'}",
                 f"霍尔2 (遮光板): {'有磁场' if payload[9] == 0x01 else '无磁场'}",
                 f"护眼屏: {'已接入' if payload[10] == 0x01 else '未接入'}",
