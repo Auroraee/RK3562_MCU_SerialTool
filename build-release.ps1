@@ -48,7 +48,8 @@ param(
     [switch]$RunTests,
     [switch]$Push,
     [switch]$CreateRelease,
-    [switch]$WhatIf
+    [switch]$WhatIf,
+    [string]$CommitMessage = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,7 +90,7 @@ $defaultNotes = @"
 if ([string]::IsNullOrWhiteSpace($Notes)) {
     $Notes = $defaultNotes
 }
-$commitMessage = "Release version $normalizedVersion."
+$defaultCommitMessage = "Release version $normalizedVersion."
 
 function Invoke-Step {
     param(
@@ -253,9 +254,16 @@ if ($Push) {
         }
     }
 
+    if ([string]::IsNullOrWhiteSpace($CommitMessage)) {
+        $CommitMessage = Read-Host "Commit message (Enter = '$defaultCommitMessage')"
+        if ([string]::IsNullOrWhiteSpace($CommitMessage)) {
+            $CommitMessage = $defaultCommitMessage
+        }
+    }
+
     Invoke-Step "Commit source changes" {
         Invoke-CheckedCommand $gitCmd @("add", "--", $pythonFile, $iconFile, $pngFile, (Join-Path $repoRoot "build-release.ps1"))
-        Invoke-CheckedCommand $gitCmd @("commit", "-m", $commitMessage)
+        Invoke-CheckedCommand $gitCmd @("commit", "-m", $CommitMessage)
     }
 
     Invoke-Step "Push branch $mainBranch" {
