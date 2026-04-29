@@ -154,7 +154,9 @@ if ($statusLines) {
         " M rk3562_uart_tester.py",
         " M a.ico",
         " M a.png",
+        " M bg.png",
         " M build-release.ps1",
+        "?? bg.png",
         "?? build-release.ps1"
     )
     $unexpected = @($statusLines | Where-Object { $_ -notin $allowedDirty })
@@ -212,6 +214,7 @@ Invoke-Step "Build Windows executable" {
         "--windowed",
         "--icon", $iconFile,
         "--name", $appName,
+        "--add-data", "bg.png;.",
         $pythonFile
     )
 }
