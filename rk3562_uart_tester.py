@@ -47,7 +47,7 @@ except ImportError:
     _HAS_PIL = False
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -165,7 +165,7 @@ def parse_from_buffer(buf: bytearray):
     if length > 1024:             # sanity: max payload 1024
         return None, 1            # bad frame, skip this header byte
 
-    total = 10 + length           # 8 header bytes + payload + crc + end
+    total = 10 + length           # 8(header) + length(payload) + 1(CRC) + 1(End)
     if len(buf) < total:
         return None, 0            # wait for rest of frame
 
@@ -362,37 +362,6 @@ class App(tk.Tk):
         "hb_hex":  "#ede9e0",
     }
 
-    # ─────────────────────────────────────────────────────────────
-    @staticmethod
-    def _detect_dark_mode() -> bool:
-        """Return True if the OS is currently in dark mode."""
-        system = platform.system()
-        try:
-            if system == "Windows":
-                import winreg
-                key = winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-                val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-                winreg.CloseKey(key)
-                return val == 0           # 0 = dark, 1 = light
-            elif system == "Darwin":
-                import subprocess
-                r = subprocess.run(
-                    ["defaults", "read", "-g", "AppleInterfaceStyle"],
-                    capture_output=True, text=True)
-                return r.stdout.strip().lower() == "dark"
-            elif system == "Linux":
-                import subprocess
-                r = subprocess.run(
-                    ["gsettings", "get",
-                     "org.gnome.desktop.interface", "color-scheme"],
-                    capture_output=True, text=True)
-                return "dark" in r.stdout.lower()
-        except Exception:
-            pass
-        return True   # default to dark if detection fails
-
     def __init__(self):
         # ── DPI scale factor (must be before super().__init__) ──
         self.dpi_scale = self._get_dpi_scale() if platform.system() == 'Windows' else 1.0
@@ -403,8 +372,6 @@ class App(tk.Tk):
         self.title(f"{APP_NAME}  v{APP_VERSION}")
         self.minsize(self._s(960), self._s(640))
 
-        # Theme — keep the same palette in both OS light/dark modes
-        self._dark = self._detect_dark_mode()
         self.C = self.THEME_C.copy()
         self.configure(bg=self.C["bg"])
 
@@ -415,6 +382,8 @@ class App(tk.Tk):
         self.rx_buf   = bytearray()
         self.log_q    = queue.Queue()
         self.stats    = {"tx": 0, "rx": 0, "err": 0}
+        self.stats_lock = threading.Lock()
+        self._tx_lock = threading.Lock()
 
         # heartbeat state
         self.hb_rk_enabled  = tk.BooleanVar(value=False)
@@ -873,7 +842,7 @@ class App(tk.Tk):
         self.log_canvas.yview_moveto(1.0)
         self._sync_bg_position()
 
-    # ── Theme switching ───────────────────────────────────────────
+    # ── Log tag colours ───────────────────────────────────────────
     def _configure_log_tags(self):
         """Apply / re-apply all log colour tags — dark colours for light photo background."""
         self._tag_colors = {
@@ -894,32 +863,6 @@ class App(tk.Tk):
             tags = self.log_canvas.gettags(item)
             if tags and tags[0] in self._tag_colors:
                 self.log_canvas.itemconfig(item, fill=self._tag_colors[tags[0]])
-
-    def _apply_theme(self, dark: bool):
-        """Keep the same palette when the OS theme changes."""
-        self._dark = dark
-        self.C = self.THEME_C.copy()
-        self.configure(bg=self.C["bg"])
-
-        # Re-apply ttk styles with shared colours
-        self._apply_styles()
-
-        # Re-apply log text tags
-        self._configure_log_tags()
-
-        # Update dot colour if disconnected
-        if not (self.ser and self.ser.is_open):
-            self.dot.configure(fg=self.C["fgdim"])
-
-    def _retheme_widgets(self, widgets):
-        """Recursively update bg/fg on classic tk widgets."""
-        skip_types = (ttk.Combobox, ttk.Button, ttk.Scrollbar,
-                      ttk.Frame, ttk.Label)
-        for w in widgets:
-            if isinstance(w, skip_types):
-                self._retheme_widgets(w.winfo_children())
-                continue
-            self._retheme_widgets(w.winfo_children())
 
     # ── Port management ───────────────────────────────────────────
     def _refresh_ports(self):
@@ -1017,7 +960,8 @@ class App(tk.Tk):
                 self.log_q.put(("raw", bytes(garbage)))
                 garbage.clear()
             del self.rx_buf[:n]
-            self.stats["rx"] += 1
+            with self.stats_lock:
+                self.stats["rx"] += 1
             self.log_q.put(("rx", frame))
         if garbage:
             self.log_q.put(("raw", bytes(garbage)))
@@ -1057,11 +1001,13 @@ class App(tk.Tk):
                 messagebox.showwarning("Not Connected",
                                        "Please connect to a serial port first.")
             return False
-        sc    = self._next_sc()
-        frame = build_frame(ft, sc, cmd, payload)
         try:
-            self.ser.write(frame)
-            self.stats["tx"] += 1
+            with self._tx_lock:
+                sc    = self._next_sc()
+                frame = build_frame(ft, sc, cmd, payload)
+                self.ser.write(frame)
+            with self.stats_lock:
+                self.stats["tx"] += 1
             if not silent:
                 self.log_q.put(("tx", {
                     "ft":       ft,
@@ -1077,7 +1023,8 @@ class App(tk.Tk):
             return True
         except Exception as exc:
             self.log_q.put(("err", f"TX error: {exc}"))
-            self.stats["err"] += 1
+            with self.stats_lock:
+                self.stats["err"] += 1
             return False
 
     # ── Predefined send actions ───────────────────────────────────
@@ -1161,8 +1108,10 @@ class App(tk.Tk):
             return
         frame = build_frame(ft, target_sc, target_cmd)
         try:
-            self.ser.write(frame)
-            self.stats["tx"] += 1
+            with self._tx_lock:
+                self.ser.write(frame)
+            with self.stats_lock:
+                self.stats["tx"] += 1
             self.log_q.put(("tx", {
                 "ft":       ft,
                 "ft_name":  FT_NAMES.get(ft),
