@@ -753,7 +753,7 @@ class App(tk.Tk):
         except tk.TclError:
             has_sel = False
         menu.add_command(
-            label="复制选中文字" if has_sel else "复制选中文字",
+            label="复制选中文字",
             command=self._log_copy_selection,
             state="normal" if has_sel else "disabled")
         menu.add_command(label="复制全部日志",
