@@ -41,7 +41,7 @@ import tkinter.font as tkFont
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP_NAME = "RK3562 MCU UART Validation Tool"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 
 # ═══════════════════════════════════════════════════════════════════
