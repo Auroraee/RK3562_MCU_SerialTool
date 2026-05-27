@@ -40,12 +40,6 @@ import tkinter as tk
 import tkinter.font as tkFont
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-try:
-    from PIL import Image, ImageTk
-    _HAS_PIL = True
-except ImportError:
-    _HAS_PIL = False
-
 APP_NAME = "RK3562 MCU UART Validation Tool"
 APP_VERSION = "1.4.1"
 
@@ -391,31 +385,12 @@ class App(tk.Tk):
         self.hb_running = False
 
         self._apply_styles()
-        self._load_bg_image()
         self._build_ui()
         self.update_idletasks()
         self._fit_initial_height()
         self._update_cmd_scroll_state()
         self._refresh_ports()
         self._pump_log()
-
-    # ── Background image ─────────────────────────────────────────
-    def _load_bg_image(self):
-        """Load background image (bg.png) if available. Falls back silently."""
-        self._bg_pil_orig = None
-        self._bg_photo = None
-        if not _HAS_PIL:
-            return
-        try:
-            if getattr(sys, 'frozen', False):
-                base = sys._MEIPASS
-            else:
-                base = os.path.dirname(os.path.abspath(__file__))
-            path = os.path.join(base, "bg.png")
-            if os.path.isfile(path):
-                self._bg_pil_orig = Image.open(path)
-        except Exception:
-            self._bg_pil_orig = None
 
     def _get_dpi_scale(self) -> float:
         """获取主显示器的 DPI 缩放比例（1.0=100%, 2.0=200%）"""
@@ -742,127 +717,86 @@ class App(tk.Tk):
                               bg=self.C["bg"], fg=fg).pack(
                 side="right", padx=4)
 
-        self.log_canvas = tk.Canvas(parent, highlightthickness=0, bd=0,
-                                     bg=self.C["panel"])
-        vsb = ttk.Scrollbar(parent, orient="vertical",   command=self._canvas_yscroll)
-        hsb = ttk.Scrollbar(parent, orient="horizontal", command=self._canvas_xscroll)
-        self.log_canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-        self.log_canvas.pack(fill="both", expand=True)
-
-        # Canvas state
+        # Text widget — native selection, Ctrl+C, Ctrl+A
         self._log_font = tkFont.Font(family="Microsoft YaHei UI", size=10)
-        self._line_height = self._log_font.metrics("linespace") + 2
-        self._canvas_x = 0
-        self._canvas_y = 2
-        self._max_width = 0
-        self._log_lines = []
-        self._log_items = []
-        self._log_item_lines = []   # list of lists, one per line
-        self._MAX_LOG_ITEMS = 3000
-        self._bg_canvas_item = None
-        self._log_canvas_photo = None
+        vsb = ttk.Scrollbar(parent, orient="vertical")
+        self.log_text = tk.Text(
+            parent, wrap="none", state="disabled",
+            bg=self.C["panel"], fg=self.C["fg"],
+            insertbackground=self.C["fg"],
+            selectbackground="#9ec2f0", selectforeground="#1a1a1a",
+            font=self._log_font, bd=0, highlightthickness=0,
+            padx=6, pady=4,
+            yscrollcommand=vsb.set,
+        )
+        vsb.configure(command=self.log_text.yview)
+        vsb.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True)
 
-        # Background image on canvas
-        self._bg_resize_after = None
-        if self._bg_pil_orig is not None:
-            self.log_canvas.bind("<Configure>", self._schedule_bg_resize)
-            self.after(1, lambda: self._on_log_canvas_resize(None))
+        self._MAX_LOG_ITEMS = 5000
 
-        # Mouse wheel
-        self.log_canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
+        # Right-click context menu
+        self.log_text.bind("<Button-3>", self._on_log_right_click)
 
         self._configure_log_tags()
 
-    # ── Background image on log canvas ────────────────────────────
-    def _schedule_bg_resize(self, event):
-        """Debounce canvas resize to avoid lag during window drag."""
-        if self._bg_resize_after is not None:
-            self.after_cancel(self._bg_resize_after)
-        self._bg_resize_after = self.after(150, lambda: self._on_log_canvas_resize(event))
-
-    def _on_log_canvas_resize(self, event):
-        """Resize background image to fit the canvas visible area."""
-        w = self.log_canvas.winfo_width()
-        h = self.log_canvas.winfo_height()
-        if w < 2 or h < 2 or self._bg_pil_orig is None:
-            return
-        if hasattr(self, '_bg_cached_size') and self._bg_cached_size == (w, h):
-            return
-        self._bg_cached_size = (w, h)
+    # ── Right-click context menu for log text ────────────────────
+    def _on_log_right_click(self, event):
+        menu = tk.Menu(self, tearoff=0,
+                       bg=self.C["card"], fg=self.C["fg"],
+                       activebackground=self.C["accent"],
+                       activeforeground="#faf8f5",
+                       font=("Microsoft YaHei UI", 10))
         try:
-            orig_w, orig_h = self._bg_pil_orig.size
-            # Cover mode: scale to fill while keeping aspect ratio, crop overflow
-            scale = max(w / orig_w, h / orig_h)
-            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-            resized = self._bg_pil_orig.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            # Center crop to target size
-            left = (new_w - w) // 2
-            top = (new_h - h) // 2
-            resized = resized.crop((left, top, left + w, top + h))
-            # Fade background for subtler appearance
-            resized = resized.convert("RGBA")
-            overlay = Image.new("RGBA", resized.size, (255, 255, 255, 200))
-            resized = Image.alpha_composite(resized, overlay)
-            self._log_canvas_photo = ImageTk.PhotoImage(resized)
-            if self._bg_canvas_item is None:
-                self._bg_canvas_item = self.log_canvas.create_image(
-                    0, 0, anchor="nw", image=self._log_canvas_photo, tags=("bg",))
-            else:
-                self.log_canvas.itemconfig(self._bg_canvas_item, image=self._log_canvas_photo)
-            self.log_canvas.tag_lower("bg")
-            self._sync_bg_position()
-        except Exception:
+            sel = self.log_text.get("sel.first", "sel.last")
+            has_sel = True
+        except tk.TclError:
+            has_sel = False
+        menu.add_command(
+            label="复制选中文字" if has_sel else "复制选中文字",
+            command=self._log_copy_selection,
+            state="normal" if has_sel else "disabled")
+        menu.add_command(label="复制全部日志",
+                         command=self._log_copy_all)
+        menu.add_separator()
+        menu.add_command(label="全选",
+                         command=lambda: self.log_text.tag_add("sel", "1.0", "end"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _log_copy_selection(self):
+        try:
+            sel = self.log_text.get("sel.first", "sel.last")
+            self.clipboard_clear()
+            self.clipboard_append(sel)
+        except tk.TclError:
             pass
 
-    def _sync_bg_position(self):
-        """Keep background image fixed at the top-left of the visible viewport."""
-        if self._bg_canvas_item is None:
-            return
-        self.log_canvas.coords(
-            self._bg_canvas_item,
-            self.log_canvas.canvasx(0), self.log_canvas.canvasy(0))
-
-    # ── Canvas scrolling ──────────────────────────────────────────
-    def _canvas_yscroll(self, *args):
-        self.log_canvas.yview(*args)
-        self._sync_bg_position()
-
-    def _canvas_xscroll(self, *args):
-        self.log_canvas.xview(*args)
-        self._sync_bg_position()
-
-    def _on_canvas_mousewheel(self, event):
-        self.log_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self._sync_bg_position()
-        return "break"
-
-    def _canvas_scroll_to_end(self):
-        self.log_canvas.yview_moveto(1.0)
-        self._sync_bg_position()
+    def _log_copy_all(self):
+        text = self.log_text.get("1.0", "end-1c")
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self._log_info(f"已复制全部日志到剪贴板")
 
     # ── Log tag colours ───────────────────────────────────────────
     def _configure_log_tags(self):
-        """Apply / re-apply all log colour tags — dark colours for light photo background."""
-        self._tag_colors = {
-            "ts":      "#4a4a4a",   # dark grey
-            "tx_dir":  "#1b5e20",   # dark green
-            "rx_dir":  "#0d47a1",   # dark blue
-            "err":     "#b71c1c",   # dark red
-            "info":    "#e65100",   # dark orange
-            "hex":     "#4a4a4a",   # dark grey
-            "crc_ok":  "#1b5e20",   # dark green
-            "crc_err": "#b71c1c",   # dark red
-            "decoded": "#0d47a1",   # dark blue
-            "cmd":     "#1a1a1a",   # near-black
-            "hb_dim":  "#bbbbbb",   # very light grey — heartbeat visually suppressed
-            "hb_hex":  "#bbbbbb",   # very light grey
+        """Configure colour tags for the Text widget."""
+        tag_colors = {
+            "ts":      "#4a4a4a",
+            "tx_dir":  "#1b5e20",
+            "rx_dir":  "#0d47a1",
+            "err":     "#b71c1c",
+            "info":    "#e65100",
+            "hex":     "#4a4a4a",
+            "crc_ok":  "#1b5e20",
+            "crc_err": "#b71c1c",
+            "decoded": "#0d47a1",
+            "cmd":     "#1a1a1a",
+            "hb_dim":  "#bbbbbb",
+            "hb_hex":  "#bbbbbb",
         }
-        for item in self._log_items:
-            tags = self.log_canvas.gettags(item)
-            if tags and tags[0] in self._tag_colors:
-                self.log_canvas.itemconfig(item, fill=self._tag_colors[tags[0]])
+        for tag, color in tag_colors.items():
+            self.log_text.tag_configure(tag, foreground=color)
 
     # ── Port management ───────────────────────────────────────────
     def _refresh_ports(self):
@@ -1166,41 +1100,21 @@ class App(tk.Tk):
 
     def _write(self, *parts):
         """parts: [(text, tag), ...]"""
-        line_y = self._canvas_y
-        line_text = ""
-        line_items = []
+        self.log_text.configure(state="normal")
         for text, tag in parts:
             if not text:
                 continue
-            fill = self._tag_colors.get(tag, self.C["fg"])
-            item = self.log_canvas.create_text(
-                self._canvas_x, line_y,
-                text=text, anchor="nw",
-                font=self._log_font, fill=fill,
-                tags=(tag,)
-            )
-            self._log_items.append(item)
-            line_items.append(item)
-            text_width = self._log_font.measure(text)
-            self._canvas_x += text_width
-            self._max_width = max(self._max_width, self._canvas_x)
-            line_text += text
-        self._canvas_y += self._line_height
-        self._canvas_x = 0
-        self.log_canvas.configure(
-            scrollregion=(0, 0, max(self._max_width + 20, self.log_canvas.winfo_width()),
-                          self._canvas_y + 20)
-        )
-        self._canvas_scroll_to_end()
-        self._log_lines.append(line_text)
-        self._log_item_lines.append(line_items)
-        # Prune oldest lines when item count exceeds limit
-        while len(self._log_items) > self._MAX_LOG_ITEMS and self._log_item_lines:
-            old_line = self._log_item_lines.pop(0)
-            self._log_lines.pop(0)
-            for it in old_line:
-                self.log_canvas.delete(it)
-                self._log_items.remove(it)
+            self.log_text.insert("end", text, (tag,))
+        self.log_text.insert("end", "\n")
+        self.log_text.configure(state="disabled")
+        self.log_text.see("end")
+        # Prune oldest lines when total exceeds limit
+        total = int(self.log_text.index("end-1c").split(".")[0])
+        if total > self._MAX_LOG_ITEMS:
+            excess = total - self._MAX_LOG_ITEMS
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", f"{excess + 1}.0")
+            self.log_text.configure(state="disabled")
 
     def _log_frame(self, f: dict, tx: bool):
         if tx and not self.show_tx.get():
@@ -1290,16 +1204,9 @@ class App(tk.Tk):
                  f"ERR: {self.stats['err']}")
 
     def _clear_log(self):
-        for item in self._log_items:
-            self.log_canvas.delete(item)
-        self._log_items.clear()
-        self._log_item_lines.clear()
-        self._log_lines.clear()
-        self._canvas_x = 0
-        self._canvas_y = 2
-        self._max_width = 0
-        self.log_canvas.configure(scrollregion=(0, 0, 1, 1))
-        self._sync_bg_position()
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
 
     def _save_log(self):
         path = filedialog.asksaveasfilename(
@@ -1309,7 +1216,7 @@ class App(tk.Tk):
         )
         if not path:
             return
-        content = "\n".join(self._log_lines) + "\n"
+        content = self.log_text.get("1.0", "end-1c")
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
